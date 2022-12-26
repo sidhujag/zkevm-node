@@ -8,12 +8,14 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/0xPolygonHermez/zkevm-node/encoding"
 	"github.com/0xPolygonHermez/zkevm-node/hex"
 	"github.com/0xPolygonHermez/zkevm-node/log"
 	"github.com/0xPolygonHermez/zkevm-node/merkletree"
+	"github.com/0xPolygonHermez/zkevm-node/state/metrics"
 	"github.com/0xPolygonHermez/zkevm-node/state/runtime"
 	"github.com/0xPolygonHermez/zkevm-node/state/runtime/executor"
 	"github.com/0xPolygonHermez/zkevm-node/state/runtime/executor/pb"
@@ -33,11 +35,24 @@ import (
 
 const (
 	// Size of the memory in bytes reserved by the zkEVM
-	zkEVMReservedMemorySize int    = 128
-	two                     uint   = 2
-	three                   uint64 = 3
-	cTrue                          = 1
-	cFalse                         = 0
+	zkEVMReservedMemorySize int  = 128
+	two                     uint = 2
+	cTrue                        = 1
+	cFalse                       = 0
+)
+
+var (
+	once sync.Once
+)
+
+// CallerLabel is used to point which entity is the caller of a given function
+type CallerLabel string
+
+const (
+	// SequencerCallerLabel is used when sequencer is calling the function
+	SequencerCallerLabel CallerLabel = "sequencer"
+	// SynchronizerCallerLabel is used when synchronizer is calling the function
+	SynchronizerCallerLabel CallerLabel = "synchronizer"
 )
 
 var (
@@ -47,22 +62,45 @@ var (
 	ZeroAddress = common.Address{}
 )
 
-// State is a implementation of the state
+// State is an implementation of the state
 type State struct {
 	cfg Config
 	*PostgresStorage
 	executorClient pb.ExecutorServiceClient
 	tree           *merkletree.StateTree
+
+	lastL2BlockSeen         types.Block
+	newL2BlockEvents        chan NewL2BlockEvent
+	newL2BlockEventHandlers []NewL2BlockEventHandler
 }
 
 // NewState creates a new State
 func NewState(cfg Config, storage *PostgresStorage, executorClient pb.ExecutorServiceClient, stateTree *merkletree.StateTree) *State {
-	return &State{
-		cfg:             cfg,
-		PostgresStorage: storage,
-		executorClient:  executorClient,
-		tree:            stateTree,
+	once.Do(func() {
+		metrics.Register()
+	})
+
+	lastL2Block, err := storage.GetLastL2Block(context.Background(), nil)
+	if errors.Is(err, ErrStateNotSynchronized) {
+		lastL2Block = types.NewBlockWithHeader(&types.Header{Number: big.NewInt(0)})
+	} else if err != nil {
+		log.Fatalf("failed to load the last l2 block: %v", err)
 	}
+
+	s := &State{
+		cfg:                     cfg,
+		PostgresStorage:         storage,
+		executorClient:          executorClient,
+		tree:                    stateTree,
+		lastL2BlockSeen:         *lastL2Block,
+		newL2BlockEvents:        make(chan NewL2BlockEvent),
+		newL2BlockEventHandlers: []NewL2BlockEventHandler{},
+	}
+
+	go s.monitorNewL2Blocks()
+	go s.handleEvents()
+
+	return s
 }
 
 // BeginStateTransaction starts a state transaction
@@ -217,24 +255,24 @@ func (s *State) EstimateGas(transaction *types.Transaction, senderAddress common
 
 		// Create a batch to be sent to the executor
 		processBatchRequest := &pb.ProcessBatchRequest{
-			BatchNum:         lastBatch.BatchNumber + 1,
+			OldBatchNum:      lastBatch.BatchNumber,
 			BatchL2Data:      batchL2Data,
 			From:             senderAddress.String(),
 			OldStateRoot:     l2BlockStateRoot.Bytes(),
 			GlobalExitRoot:   lastBatch.GlobalExitRoot.Bytes(),
-			OldLocalExitRoot: previousBatch.LocalExitRoot.Bytes(),
+			OldAccInputHash:  previousBatch.AccInputHash.Bytes(),
 			EthTimestamp:     uint64(lastBatch.Timestamp.Unix()),
 			Coinbase:         lastBatch.Coinbase.String(),
 			UpdateMerkleTree: cFalse,
 			ChainId:          s.cfg.ChainID,
 		}
 
-		log.Debugf("EstimateGas[processBatchRequest.BatchNum]: %v", processBatchRequest.BatchNum)
+		log.Debugf("EstimateGas[processBatchRequest.OldBatchNum]: %v", processBatchRequest.OldBatchNum)
 		// log.Debugf("EstimateGas[processBatchRequest.BatchL2Data]: %v", hex.EncodeToHex(processBatchRequest.BatchL2Data))
 		log.Debugf("EstimateGas[processBatchRequest.From]: %v", processBatchRequest.From)
 		log.Debugf("EstimateGas[processBatchRequest.OldStateRoot]: %v", hex.EncodeToHex(processBatchRequest.OldStateRoot))
 		log.Debugf("EstimateGas[processBatchRequest.GlobalExitRoot]: %v", hex.EncodeToHex(processBatchRequest.GlobalExitRoot))
-		log.Debugf("EstimateGas[processBatchRequest.OldLocalExitRoot]: %v", hex.EncodeToHex(processBatchRequest.OldLocalExitRoot))
+		log.Debugf("EstimateGas[processBatchRequest.OldAccInputHash]: %v", hex.EncodeToHex(processBatchRequest.OldAccInputHash))
 		log.Debugf("EstimateGas[processBatchRequest.EthTimestamp]: %v", processBatchRequest.EthTimestamp)
 		log.Debugf("EstimateGas[processBatchRequest.Coinbase]: %v", processBatchRequest.Coinbase)
 		log.Debugf("EstimateGas[processBatchRequest.UpdateMerkleTree]: %v", processBatchRequest.UpdateMerkleTree)
@@ -295,10 +333,6 @@ func (s *State) EstimateGas(transaction *types.Transaction, senderAddress common
 		lowEnd = gasUsed
 	}
 
-	if gasUsed > 0 {
-		highEnd = (gasUsed * three) / uint64(two)
-	}
-
 	// Start the binary search for the lowest possible gas price
 	for (lowEnd < highEnd) && (highEnd-lowEnd) > 4096 {
 		txExecutionStart := time.Now()
@@ -343,8 +377,7 @@ func isGasApplyError(err error) bool {
 
 // Checks if EVM level valid gas errors occurred
 func isGasEVMError(err error) bool {
-	return errors.Is(err, runtime.ErrOutOfGas) ||
-		errors.Is(err, runtime.ErrCodeStoreOutOfGas)
+	return errors.Is(err, runtime.ErrOutOfGas)
 }
 
 // Checks if the EVM reverted during execution
@@ -388,14 +421,20 @@ func (s *State) OpenBatch(ctx context.Context, processingContext ProcessingConte
 }
 
 // ProcessSequencerBatch is used by the sequencers to process transactions into an open batch
-func (s *State) ProcessSequencerBatch(ctx context.Context, batchNumber uint64, txs []types.Transaction, dbTx pgx.Tx) (*ProcessBatchResponse, error) {
+func (s *State) ProcessSequencerBatch(
+	ctx context.Context,
+	batchNumber uint64,
+	txs []types.Transaction,
+	dbTx pgx.Tx,
+	caller CallerLabel,
+) (*ProcessBatchResponse, error) {
 	log.Debugf("*******************************************")
 	log.Debugf("ProcessSequencerBatch start")
 	batchL2Data, err := EncodeTransactions(txs)
 	if err != nil {
 		return nil, err
 	}
-	processBatchResponse, err := s.processBatch(ctx, batchNumber, batchL2Data, dbTx)
+	processBatchResponse, err := s.processBatch(ctx, batchNumber, batchL2Data, dbTx, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -428,12 +467,12 @@ func (s *State) ExecuteBatch(ctx context.Context, batchNumber uint64, batchL2Dat
 
 	// Create Batch
 	processBatchRequest := &pb.ProcessBatchRequest{
-		BatchNum:         lastBatch.BatchNumber,
+		OldBatchNum:      lastBatch.BatchNumber - 1,
 		Coinbase:         lastBatch.Coinbase.String(),
 		BatchL2Data:      batchL2Data,
 		OldStateRoot:     previousBatch.StateRoot.Bytes(),
 		GlobalExitRoot:   lastBatch.GlobalExitRoot.Bytes(),
-		OldLocalExitRoot: previousBatch.LocalExitRoot.Bytes(),
+		OldAccInputHash:  previousBatch.AccInputHash.Bytes(),
 		EthTimestamp:     uint64(lastBatch.Timestamp.Unix()),
 		UpdateMerkleTree: cFalse,
 		ChainId:          s.cfg.ChainID,
@@ -442,7 +481,13 @@ func (s *State) ExecuteBatch(ctx context.Context, batchNumber uint64, batchL2Dat
 	return s.executorClient.ProcessBatch(ctx, processBatchRequest)
 }
 
-func (s *State) processBatch(ctx context.Context, batchNumber uint64, batchL2Data []byte, dbTx pgx.Tx) (*pb.ProcessBatchResponse, error) {
+func (s *State) processBatch(
+	ctx context.Context,
+	batchNumber uint64,
+	batchL2Data []byte,
+	dbTx pgx.Tx,
+	caller CallerLabel,
+) (*pb.ProcessBatchResponse, error) {
 	if dbTx == nil {
 		return nil, ErrDBTxNil
 	}
@@ -474,31 +519,33 @@ func (s *State) processBatch(ctx context.Context, batchNumber uint64, batchL2Dat
 	}
 	// Create Batch
 	processBatchRequest := &pb.ProcessBatchRequest{
-		BatchNum:         lastBatch.BatchNumber,
+		OldBatchNum:      lastBatch.BatchNumber - 1,
 		Coinbase:         lastBatch.Coinbase.String(),
 		BatchL2Data:      batchL2Data,
 		OldStateRoot:     previousBatch.StateRoot.Bytes(),
 		GlobalExitRoot:   lastBatch.GlobalExitRoot.Bytes(),
-		OldLocalExitRoot: previousBatch.LocalExitRoot.Bytes(),
+		OldAccInputHash:  previousBatch.AccInputHash.Bytes(),
 		EthTimestamp:     uint64(lastBatch.Timestamp.Unix()),
 		UpdateMerkleTree: cTrue,
 		ChainId:          s.cfg.ChainID,
 	}
 
 	// Send Batch to the Executor
-	log.Debugf("processBatch[processBatchRequest.BatchNum]: %v", processBatchRequest.BatchNum)
+	log.Debugf("processBatch[processBatchRequest.OldBatchNum]: %v", processBatchRequest.OldBatchNum)
 	// log.Debugf("processBatch[processBatchRequest.BatchL2Data]: %v", hex.EncodeToHex(processBatchRequest.BatchL2Data))
 	log.Debugf("processBatch[processBatchRequest.From]: %v", processBatchRequest.From)
 	log.Debugf("processBatch[processBatchRequest.OldStateRoot]: %v", hex.EncodeToHex(processBatchRequest.OldStateRoot))
 	log.Debugf("processBatch[processBatchRequest.GlobalExitRoot]: %v", hex.EncodeToHex(processBatchRequest.GlobalExitRoot))
-	log.Debugf("processBatch[processBatchRequest.OldLocalExitRoot]: %v", hex.EncodeToHex(processBatchRequest.OldLocalExitRoot))
+	log.Debugf("processBatch[processBatchRequest.OldAccInputHash]: %v", hex.EncodeToHex(processBatchRequest.OldAccInputHash))
 	log.Debugf("processBatch[processBatchRequest.EthTimestamp]: %v", processBatchRequest.EthTimestamp)
 	log.Debugf("processBatch[processBatchRequest.Coinbase]: %v", processBatchRequest.Coinbase)
 	log.Debugf("processBatch[processBatchRequest.UpdateMerkleTree]: %v", processBatchRequest.UpdateMerkleTree)
 	log.Debugf("processBatch[processBatchRequest.ChainId]: %v", processBatchRequest.ChainId)
 	now := time.Now()
 	res, err := s.executorClient.ProcessBatch(ctx, processBatchRequest)
-	log.Infof("It took %v for the executor to process the request", time.Since(now))
+	elapsed := time.Since(now)
+	metrics.ExecutorProcessingTime(string(caller), elapsed)
+	log.Infof("It took %v for the executor to process the request", elapsed)
 	return res, err
 }
 
@@ -540,7 +587,7 @@ func (s *State) StoreTransactions(ctx context.Context, batchNumber uint64, proce
 		// if the transaction has an intrinsic invalid tx error it means
 		// the transaction has not changed the state, so we don't store it
 		// and just move to the next
-		if errors.Is(processedTx.Error, runtime.ErrIntrinsicInvalidTransaction) {
+		if executor.IsIntrinsicError(executor.ErrorCode(processedTx.Error)) {
 			continue
 		}
 
@@ -679,7 +726,13 @@ func (s *State) CloseBatch(ctx context.Context, receipt ProcessingReceipt, dbTx 
 }
 
 // ProcessAndStoreClosedBatch is used by the Synchronizer to add a closed batch into the data base
-func (s *State) ProcessAndStoreClosedBatch(ctx context.Context, processingCtx ProcessingContext, encodedTxs []byte, dbTx pgx.Tx) error {
+func (s *State) ProcessAndStoreClosedBatch(
+	ctx context.Context,
+	processingCtx ProcessingContext,
+	encodedTxs []byte,
+	dbTx pgx.Tx,
+	caller CallerLabel,
+) error {
 	// Decode transactions
 	decodedTransactions, _, err := DecodeTxs(encodedTxs)
 	if err != nil {
@@ -694,20 +747,25 @@ func (s *State) ProcessAndStoreClosedBatch(ctx context.Context, processingCtx Pr
 	if err := s.OpenBatch(ctx, processingCtx, dbTx); err != nil {
 		return err
 	}
-	processed, err := s.processBatch(ctx, processingCtx.BatchNumber, encodedTxs, dbTx)
+	processed, err := s.processBatch(ctx, processingCtx.BatchNumber, encodedTxs, dbTx, caller)
 	if err != nil {
 		return err
 	}
 
 	// Sanity check
 	if len(decodedTransactions) != len(processed.Responses) {
-		return fmt.Errorf("number of decoded (%d) and processed (%d) transactions do not match", len(decodedTransactions), len(processed.Responses))
+		log.Errorf("number of decoded (%d) and processed (%d) transactions do not match", len(decodedTransactions), len(processed.Responses))
 	}
 
 	// Filter unprocessed txs and decode txs to store metadata
 	// note that if the batch is not well encoded it will result in an empty batch (with no txs)
 	for i := 0; i < len(processed.Responses); i++ {
 		if !isProcessed(processed.Responses[i].Error) {
+			if executor.IsOutOfCountersError(processed.Responses[i].Error) {
+				processed.Responses = []*pb.ProcessTransactionResponse{}
+				break
+			}
+
 			// Remove unprocessed tx
 			if i == len(processed.Responses)-1 {
 				processed.Responses = processed.Responses[:i]
@@ -724,10 +782,13 @@ func (s *State) ProcessAndStoreClosedBatch(ctx context.Context, processingCtx Pr
 	if err != nil {
 		return err
 	}
-	// Store processed txs into the batch
-	err = s.StoreTransactions(ctx, processingCtx.BatchNumber, processedBatch.Responses, dbTx)
-	if err != nil {
-		return err
+
+	if len(processedBatch.Responses) > 0 {
+		// Store processed txs into the batch
+		err = s.StoreTransactions(ctx, processingCtx.BatchNumber, processedBatch.Responses, dbTx)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Close batch
@@ -735,6 +796,7 @@ func (s *State) ProcessAndStoreClosedBatch(ctx context.Context, processingCtx Pr
 		BatchNumber:   processingCtx.BatchNumber,
 		StateRoot:     processedBatch.NewStateRoot,
 		LocalExitRoot: processedBatch.NewLocalExitRoot,
+		AccInputHash:  processedBatch.NewAccInputHash,
 	}, encodedTxs, dbTx)
 }
 
@@ -791,11 +853,11 @@ func (s *State) DebugTransaction(ctx context.Context, transactionHash common.Has
 
 	// Create Batch
 	processBatchRequest := &pb.ProcessBatchRequest{
-		BatchNum:                     batch.BatchNumber,
+		OldBatchNum:                  batch.BatchNumber - 1,
 		BatchL2Data:                  batchL2Data,
 		OldStateRoot:                 pBatch.StateRoot.Bytes(),
 		GlobalExitRoot:               batch.GlobalExitRoot.Bytes(),
-		OldLocalExitRoot:             pBatch.LocalExitRoot.Bytes(),
+		OldAccInputHash:              pBatch.AccInputHash.Bytes(),
 		EthTimestamp:                 uint64(batch.Timestamp.Unix()),
 		Coinbase:                     batch.Coinbase.String(),
 		UpdateMerkleTree:             cFalse,
@@ -1075,12 +1137,12 @@ func (s *State) ProcessUnsignedTransaction(ctx context.Context, tx *types.Transa
 
 	// Create Batch
 	processBatchRequest := &pb.ProcessBatchRequest{
-		BatchNum:         lastBatch.BatchNumber + 1,
+		OldBatchNum:      lastBatch.BatchNumber,
 		BatchL2Data:      batchL2Data,
 		From:             senderAddress.String(),
 		OldStateRoot:     l2BlockStateRoot.Bytes(),
 		GlobalExitRoot:   lastBatch.GlobalExitRoot.Bytes(),
-		OldLocalExitRoot: previousBatch.LocalExitRoot.Bytes(),
+		OldAccInputHash:  previousBatch.AccInputHash.Bytes(),
 		EthTimestamp:     uint64(lastBatch.Timestamp.Unix()),
 		Coinbase:         lastBatch.Coinbase.String(),
 		UpdateMerkleTree: cFalse,
@@ -1091,12 +1153,12 @@ func (s *State) ProcessUnsignedTransaction(ctx context.Context, tx *types.Transa
 		processBatchRequest.NoCounters = cTrue
 	}
 
-	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.BatchNum]: %v", processBatchRequest.BatchNum)
+	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.OldBatchNum]: %v", processBatchRequest.OldBatchNum)
 	// log.Debugf("ProcessUnsignedTransaction[processBatchRequest.BatchL2Data]: %v", hex.EncodeToHex(processBatchRequest.BatchL2Data))
 	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.From]: %v", processBatchRequest.From)
 	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.OldStateRoot]: %v", hex.EncodeToHex(processBatchRequest.OldStateRoot))
 	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.GlobalExitRoot]: %v", hex.EncodeToHex(processBatchRequest.GlobalExitRoot))
-	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.OldLocalExitRoot]: %v", hex.EncodeToHex(processBatchRequest.OldLocalExitRoot))
+	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.OldAccInputHash]: %v", hex.EncodeToHex(processBatchRequest.OldAccInputHash))
 	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.EthTimestamp]: %v", processBatchRequest.EthTimestamp)
 	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.Coinbase]: %v", processBatchRequest.Coinbase)
 	log.Debugf("ProcessUnsignedTransaction[processBatchRequest.UpdateMerkleTree]: %v", processBatchRequest.UpdateMerkleTree)
@@ -1306,4 +1368,130 @@ func DetermineProcessedTransactions(responses []*ProcessTransactionResponse) (
 		}
 	}
 	return processedTxResponses, processedTxsHashes, unprocessedTxResponses, unprocessedTxsHashes
+}
+
+// WaitSequencingTxToBeSynced waits for a sequencing transaction to be synced into the state
+func (s *State) WaitSequencingTxToBeSynced(parentCtx context.Context, tx *types.Transaction, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+
+	for {
+		virtualized, err := s.IsSequencingTXSynced(ctx, tx.Hash(), nil)
+		if err != nil && err != ErrNotFound {
+			log.Errorf("error waiting sequencing tx %s to be synced: %w", tx.Hash().String(), err)
+			return err
+		} else if ctx.Err() != nil {
+			log.Errorf("error waiting sequencing tx %s to be synced: %w", tx.Hash().String(), err)
+			return ctx.Err()
+		} else if virtualized {
+			break
+		}
+
+		time.Sleep(time.Second)
+	}
+
+	log.Debug("Sequencing txh successfully synced: ", tx.Hash().String())
+	return nil
+}
+
+// WaitVerifiedBatchToBeSynced waits for a sequenced batch to be synced into the state
+func (s *State) WaitVerifiedBatchToBeSynced(parentCtx context.Context, batchNumber uint64, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+
+	for {
+		batch, err := s.GetVerifiedBatch(ctx, batchNumber, nil)
+		if err != nil && err != ErrNotFound {
+			log.Errorf("error waiting verified batch %s to be synced: %w", batchNumber, err)
+			return err
+		} else if ctx.Err() != nil {
+			log.Errorf("error waiting verified batch %s to be synced: %w", batchNumber, err)
+			return ctx.Err()
+		} else if batch != nil {
+			break
+		}
+
+		time.Sleep(time.Second)
+	}
+
+	log.Debug("Verified batch successfully synced: ", batchNumber)
+	return nil
+}
+
+func (s *State) monitorNewL2Blocks() {
+	waitNextCycle := func() {
+		time.Sleep(1 * time.Second)
+	}
+
+	for {
+		lastL2Block, err := s.GetLastL2Block(context.Background(), nil)
+		if errors.Is(err, ErrStateNotSynchronized) {
+			waitNextCycle()
+			continue
+		} else if err != nil {
+			log.Errorf("failed to get last l2 block while monitoring new blocks: %v", err)
+			waitNextCycle()
+			continue
+		}
+
+		// not updates until now
+		if lastL2Block == nil || s.lastL2BlockSeen.NumberU64() >= lastL2Block.NumberU64() {
+			waitNextCycle()
+			continue
+		}
+
+		for bn := s.lastL2BlockSeen.NumberU64() + uint64(1); bn <= lastL2Block.NumberU64(); bn++ {
+			block, err := s.GetL2BlockByNumber(context.Background(), bn, nil)
+			if err != nil {
+				log.Errorf("failed to l2 block while monitoring new blocks: %v", err)
+				break
+			}
+
+			s.newL2BlockEvents <- NewL2BlockEvent{
+				Block: *block,
+			}
+			log.Infof("new l2 blocks detected, Number %v, Hash %v", block.NumberU64(), block.Hash().String())
+			s.lastL2BlockSeen = *block
+		}
+
+		// interval to check for new l2 blocks
+		waitNextCycle()
+	}
+}
+
+func (s *State) handleEvents() {
+	for newL2BlockEvent := range s.newL2BlockEvents {
+		log.Infof("reacting to new l2 block, Number %v, Hash %v", newL2BlockEvent.Block.NumberU64(), newL2BlockEvent.Block.Hash().String())
+		wg := sync.WaitGroup{}
+		for index, handler := range s.newL2BlockEventHandlers {
+			log.Infof("executing new l2 block event handler for block, Number %v, Hash %v, Handler Index: %v", newL2BlockEvent.Block.NumberU64(), newL2BlockEvent.Block.Hash().String(), index)
+			wg.Add(1)
+			go func(h NewL2BlockEventHandler) {
+				defer func() {
+					wg.Done()
+					if r := recover(); r != nil {
+						log.Errorf("failed and recovered in NewL2BlockEventHandler: %v", r)
+					}
+				}()
+				h(newL2BlockEvent)
+			}(handler)
+		}
+		wg.Wait()
+	}
+}
+
+// NewL2BlockEventHandler represent a func that will be called by the
+// state when a NewL2BlockEvent is triggered
+type NewL2BlockEventHandler func(e NewL2BlockEvent)
+
+// NewL2BlockEvent is a struct provided from the state to the NewL2BlockEventHandler
+// when a new l2 block is detected with data related to this new l2 block.
+type NewL2BlockEvent struct {
+	Block types.Block
+}
+
+// RegisterNewL2BlockEventHandler add the provided handler to the list of handlers
+// that will be triggered when a new l2 block event is triggered
+func (s *State) RegisterNewL2BlockEventHandler(h NewL2BlockEventHandler) {
+	s.newL2BlockEventHandlers = append(s.newL2BlockEventHandlers, h)
 }

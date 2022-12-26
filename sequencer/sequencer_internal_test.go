@@ -7,6 +7,7 @@ import (
 	"time"
 
 	cfgTypes "github.com/0xPolygonHermez/zkevm-node/config/types"
+	ethManTypes "github.com/0xPolygonHermez/zkevm-node/etherman/types"
 	"github.com/0xPolygonHermez/zkevm-node/pool"
 	sequencerMocks "github.com/0xPolygonHermez/zkevm-node/sequencer/mocks"
 	"github.com/0xPolygonHermez/zkevm-node/state"
@@ -20,7 +21,6 @@ func TestIsSynced(t *testing.T) {
 	eth := new(sequencerMocks.EthermanMock)
 	s := Sequencer{state: st, etherman: eth}
 	ctx := context.Background()
-	st.On("GetLastSequenceGroup", ctx, nil).Return(nil, state.ErrNotFound)
 	st.On("GetLastVirtualBatchNum", ctx, nil).Return(uint64(1), nil)
 	eth.On("GetLatestBatchNumber").Return(uint64(1), nil)
 	isSynced := s.isSynced(ctx)
@@ -34,7 +34,6 @@ func TestIsNotSynced(t *testing.T) {
 	eth := new(sequencerMocks.EthermanMock)
 	s := Sequencer{state: st, etherman: eth}
 	ctx := context.Background()
-	st.On("GetLastSequenceGroup", ctx, nil).Return(nil, state.ErrNotFound)
 	st.On("GetLastVirtualBatchNum", ctx, nil).Return(uint64(1), nil)
 	eth.On("GetLatestBatchNumber").Return(uint64(2), nil)
 	isSynced := s.isSynced(ctx)
@@ -45,7 +44,7 @@ func TestIsNotSynced(t *testing.T) {
 
 func TestShouldCloseSequenceTooBig(t *testing.T) {
 	s := Sequencer{}
-	s.sequenceInProgress = state.Sequence{IsSequenceTooBig: true}
+	s.sequenceInProgress = ethManTypes.Sequence{IsSequenceTooBig: true}
 	ctx := context.Background()
 	shouldClose := s.shouldCloseSequenceInProgress(ctx)
 	require.False(t, s.sequenceInProgress.IsSequenceTooBig)
@@ -59,7 +58,7 @@ func TestShouldCloseSequenceReachedMaxAmountOfTxs(t *testing.T) {
 		tx := types.NewTransaction(i, common.Address{}, big.NewInt(10), uint64(1), big.NewInt(10), []byte{})
 		txs = append(txs, *tx)
 	}
-	s.sequenceInProgress = state.Sequence{Txs: txs}
+	s.sequenceInProgress = ethManTypes.Sequence{Txs: txs}
 	ctx := context.Background()
 	shouldClose := s.shouldCloseSequenceInProgress(ctx)
 	require.True(t, shouldClose)
@@ -73,11 +72,10 @@ func TestShouldCloseDueToNewDeposits(t *testing.T) {
 	ctx := context.Background()
 	mainnetExitRoot := common.HexToHash("0x29e885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a53cf2d7d9f1")
 	lastGer := state.GlobalExitRoot{
-		BlockNumber:       1,
-		GlobalExitRootNum: big.NewInt(2),
-		MainnetExitRoot:   common.HexToHash("0x29e885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9f1"),
-		RollupExitRoot:    common.HexToHash("0x30a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
-		GlobalExitRoot:    common.HexToHash("0x40a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
+		BlockNumber:     1,
+		MainnetExitRoot: common.HexToHash("0x29e885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9f1"),
+		RollupExitRoot:  common.HexToHash("0x30a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
+		GlobalExitRoot:  common.HexToHash("0x40a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
 	}
 	s.sequenceInProgress.GlobalExitRoot = lastGer.GlobalExitRoot
 	st.On("GetBlockNumAndMainnetExitRootByGER", ctx, s.sequenceInProgress.GlobalExitRoot, nil).Return(lastGer.BlockNumber, mainnetExitRoot, nil)
@@ -96,10 +94,14 @@ func TestShouldCloseTooLongSinceLastVirtualized(t *testing.T) {
 	s := Sequencer{cfg: Config{MaxTimeForBatchToBeOpen: cfgTypes.NewDuration(1 * time.Second)}, state: st}
 	tx := types.NewTransaction(uint64(0), common.Address{}, big.NewInt(10), uint64(1), big.NewInt(10), []byte{})
 	s.sequenceInProgress.Txs = []types.Transaction{*tx}
-	s.sequenceInProgress.Timestamp = time.Now().Add(-s.cfg.MaxTimeForBatchToBeOpen.Duration)
+	s.sequenceInProgress.Timestamp = time.Now().Add(-s.cfg.MaxTimeForBatchToBeOpen.Duration).Unix()
 	ctx := context.Background()
-	isShouldCloseTooLongSinceLastSequence := s.shouldCloseTooLongSinceLastSequence(ctx)
-	require.True(t, isShouldCloseTooLongSinceLastSequence)
+	lastBatchNumber := uint64(10)
+	st.On("GetLastBatchNumber", ctx, nil).Return(lastBatchNumber, nil)
+	st.On("IsBatchVirtualized", ctx, lastBatchNumber-1, nil).Return(true, nil)
+	isShouldCloseTooLongSinceLastVirtualized, err := s.shouldCloseTooLongSinceLastVirtualized(ctx)
+	require.NoError(t, err)
+	require.True(t, isShouldCloseTooLongSinceLastVirtualized)
 	st.AssertExpectations(t)
 }
 
@@ -212,7 +214,7 @@ func TestProcessBatch(t *testing.T) {
 		NewLocalExitRoot:  common.HexToHash("0x123"),
 	}
 	st.On("GetLastBatchNumber", ctx, dbTx).Return(lastBatchNumber, nil)
-	st.On("ProcessSequencerBatch", ctx, lastBatchNumber, s.sequenceInProgress.Txs, dbTx).Return(processBatchResponse, nil)
+	st.On("ProcessSequencerBatch", ctx, lastBatchNumber, s.sequenceInProgress.Txs, dbTx, state.SequencerCallerLabel).Return(processBatchResponse, nil)
 	procResponse, err := s.processTxs(ctx)
 	require.NoError(t, err)
 	require.True(t, procResponse.isBatchProcessed)
@@ -266,9 +268,9 @@ func TestReprocessBatch(t *testing.T) {
 	txsResponseToReturn.isBatchProcessed = true
 	lastBatchNumber := uint64(10)
 	st.On("GetLastBatchNumber", ctx, dbTx).Return(lastBatchNumber, nil)
-	st.On("ProcessSequencerBatch", ctx, lastBatchNumber, txs, dbTx).Return(processBatchResponse, nil)
+	st.On("ProcessSequencerBatch", ctx, lastBatchNumber, txs, dbTx, state.SequencerCallerLabel).Return(processBatchResponse, nil)
 
-	unprocessedTxsAfterReprocess, err := s.reprocessBatch(ctx, txsResponse, state.Sequence{})
+	unprocessedTxsAfterReprocess, err := s.reprocessBatch(ctx, txsResponse, ethManTypes.Sequence{})
 	require.NoError(t, err)
 	require.Equal(t, 0, len(unprocessedTxsAfterReprocess))
 	require.Equal(t, 2, len(s.sequenceInProgress.Txs))
@@ -349,12 +351,11 @@ func TestTryToProcessTxs(t *testing.T) {
 	gpe := new(sequencerMocks.GasPriceEstimatorMock)
 	s := Sequencer{cfg: Config{
 		MaxTimeForBatchToBeOpen: cfgTypes.NewDuration(5 * time.Second),
-		MaxBatchBytesSize:       30000,
+		MaxBatchBytesSize:       150000,
 		MaxTxsPerBatch:          150,
 	}, state: st, etherman: eth, gpe: gpe, pool: pl}
 	ctx := context.Background()
 	// Check if synchronizer is up to date
-	st.On("GetLastSequenceGroup", ctx, nil).Return(nil, state.ErrNotFound)
 	st.On("GetLastVirtualBatchNum", ctx, nil).Return(uint64(1), nil)
 	eth.On("GetLatestBatchNumber").Return(uint64(1), nil)
 
@@ -363,11 +364,10 @@ func TestTryToProcessTxs(t *testing.T) {
 
 	mainnetExitRoot := common.HexToHash("0x29e885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a53cf2d7d9f1")
 	lastGer := state.GlobalExitRoot{
-		BlockNumber:       1,
-		GlobalExitRootNum: big.NewInt(2),
-		MainnetExitRoot:   common.HexToHash("0x29e885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a53cf2d7d9f1"),
-		RollupExitRoot:    common.HexToHash("0x30a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
-		GlobalExitRoot:    common.HexToHash("0x40a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
+		BlockNumber:     1,
+		MainnetExitRoot: common.HexToHash("0x29e885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a53cf2d7d9f1"),
+		RollupExitRoot:  common.HexToHash("0x30a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
+		GlobalExitRoot:  common.HexToHash("0x40a885edaf8e4b51e1d2e05f9da28161d2fb4f6b1d53827d9b80a23cf2d7d9a0"),
 	}
 	s.sequenceInProgress.GlobalExitRoot = lastGer.GlobalExitRoot
 	eth.On("GetLatestBlockNumber", ctx).Return(uint64(1), nil)
@@ -378,10 +378,13 @@ func TestTryToProcessTxs(t *testing.T) {
 
 	tx := types.NewTransaction(uint64(0), common.Address{}, big.NewInt(10), uint64(1), big.NewInt(10), []byte{})
 	s.sequenceInProgress.Txs = []types.Transaction{*tx}
-	s.sequenceInProgress.Timestamp = time.Now()
+	s.sequenceInProgress.Timestamp = time.Now().Unix()
 
 	lastBatchNumber := uint64(10)
+	st.On("GetLastBatchNumber", ctx, nil).Return(lastBatchNumber, nil)
 	st.On("GetLastBatchNumber", ctx, dbTx).Return(lastBatchNumber, nil)
+
+	st.On("IsBatchVirtualized", ctx, lastBatchNumber-1, nil).Return(true, nil)
 
 	minGasPrice := big.NewInt(1)
 	gpe.On("GetAvgGasPrice", ctx).Return(minGasPrice, nil)
@@ -417,7 +420,7 @@ func TestTryToProcessTxs(t *testing.T) {
 	}
 	var txs = s.sequenceInProgress.Txs
 	txs = append(txs, poolTxs[0].Transaction)
-	st.On("ProcessSequencerBatch", ctx, lastBatchNumber, txs, dbTx).Return(processBatchResponse, nil)
+	st.On("ProcessSequencerBatch", ctx, lastBatchNumber, txs, dbTx, state.SequencerCallerLabel).Return(processBatchResponse, nil)
 
 	processedTxs, processedTxsHashes, _, _ := state.DetermineProcessedTransactions(processBatchResponse.Responses)
 

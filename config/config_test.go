@@ -11,6 +11,7 @@ import (
 
 	"github.com/0xPolygonHermez/zkevm-node/config"
 	"github.com/0xPolygonHermez/zkevm-node/config/types"
+	"github.com/0xPolygonHermez/zkevm-node/log"
 	"github.com/0xPolygonHermez/zkevm-node/pricegetter"
 	"github.com/0xPolygonHermez/zkevm-node/sequencer"
 	"github.com/ethereum/go-ethereum/common"
@@ -23,6 +24,18 @@ func Test_Defaults(t *testing.T) {
 		path          string
 		expectedValue interface{}
 	}{
+		{
+			path:          "Log.Environment",
+			expectedValue: log.LogEnvironment("development"),
+		},
+		{
+			path:          "Log.Level",
+			expectedValue: "debug",
+		},
+		{
+			path:          "Log.Outputs",
+			expectedValue: []string{"stderr"},
+		},
 		{
 			path:          "Synchronizer.SyncChunkSize",
 			expectedValue: uint64(100),
@@ -40,6 +53,10 @@ func Test_Defaults(t *testing.T) {
 			expectedValue: types.NewDuration(1 * time.Second),
 		},
 		{
+			path:          "Sequencer.LastBatchVirtualizationTimeMaxWaitPeriod",
+			expectedValue: types.NewDuration(300 * time.Second),
+		},
+		{
 			path:          "Sequencer.WaitBlocksToUpdateGER",
 			expectedValue: uint64(10),
 		},
@@ -53,7 +70,7 @@ func Test_Defaults(t *testing.T) {
 		},
 		{
 			path:          "Sequencer.MaxBatchBytesSize",
-			expectedValue: 30000,
+			expectedValue: 150000,
 		},
 		{
 			path:          "Sequencer.MaxTimeForBatchToBeOpen",
@@ -148,12 +165,36 @@ func Test_Defaults(t *testing.T) {
 			expectedValue: true,
 		},
 		{
-			path:          "EthTxManager.IntervalToReviewSendBatchTx",
-			expectedValue: types.NewDuration(1 * time.Minute),
+			path:          "EthTxManager.MaxSendBatchTxRetries",
+			expectedValue: uint32(10),
 		},
 		{
-			path:          "EthTxManager.IntervalToReviewVerifyBatchTx",
-			expectedValue: types.NewDuration(1 * time.Minute),
+			path:          "EthTxManager.MaxVerifyBatchTxRetries",
+			expectedValue: uint32(10),
+		},
+		{
+			path:          "EthTxManager.FrequencyForResendingFailedSendBatches",
+			expectedValue: types.NewDuration(1 * time.Second),
+		},
+		{
+			path:          "EthTxManager.FrequencyForResendingFailedVerifyBatch",
+			expectedValue: types.NewDuration(1 * time.Second),
+		},
+		{
+			path:          "EthTxManager.WaitTxToBeMined",
+			expectedValue: types.NewDuration(2 * time.Minute),
+		},
+		{
+			path:          "EthTxManager.WaitTxToBeSynced",
+			expectedValue: types.NewDuration(10 * time.Second),
+		},
+		{
+			path:          "EthTxManager.PercentageToIncreaseGasPrice",
+			expectedValue: uint64(10),
+		},
+		{
+			path:          "EthTxManager.PercentageToIncreaseGasLimit",
+			expectedValue: uint64(10),
 		},
 		{
 			path:          "PriceGetter.Type",
@@ -260,32 +301,12 @@ func Test_Defaults(t *testing.T) {
 			expectedValue: "0x1111111111111111111111111111111111111111",
 		},
 		{
-			path:          "RPC.DB.User",
-			expectedValue: "rpc_user",
-		},
-		{
-			path:          "RPC.DB.Password",
-			expectedValue: "rpc_password",
-		},
-		{
-			path:          "RPC.DB.Name",
-			expectedValue: "rpc_db",
-		},
-		{
-			path:          "RPC.DB.Host",
-			expectedValue: "localhost",
-		},
-		{
-			path:          "RPC.DB.Port",
-			expectedValue: "5432",
-		},
-		{
-			path:          "RPC.DB.EnableLog",
+			path:          "RPC.WebSockets.Enabled",
 			expectedValue: false,
 		},
 		{
-			path:          "RPC.DB.MaxConns",
-			expectedValue: 200,
+			path:          "RPC.WebSockets.Port",
+			expectedValue: 8133,
 		},
 		{
 			path:          "Executor.URI",
@@ -311,6 +332,7 @@ func Test_Defaults(t *testing.T) {
 			path:          "Metrics.Enabled",
 			expectedValue: false,
 		},
+		// TODO(pg): add Aggregator section
 	}
 	file, err := os.CreateTemp("", "genesisConfig")
 	require.NoError(t, err)

@@ -4,8 +4,9 @@ import (
 	"context"
 	"math/big"
 
+	"github.com/0xPolygonHermez/zkevm-node/etherman/types"
 	"github.com/0xPolygonHermez/zkevm-node/pricegetter"
-	"github.com/0xPolygonHermez/zkevm-node/state"
+	"github.com/0xPolygonHermez/zkevm-node/sequencer/metrics"
 )
 
 // Checker checks profitability to send sequences
@@ -28,12 +29,12 @@ func New(
 }
 
 // IsSequenceProfitable check if sequence is profitable by comparing L1 tx gas cost and collateral with fee rewards
-func (c *Checker) IsSequenceProfitable(ctx context.Context, sequence state.Sequence) (bool, error) {
+func (c *Checker) IsSequenceProfitable(ctx context.Context, sequence types.Sequence) (bool, error) {
 	if c.Config.SendBatchesEvenWhenNotProfitable {
 		return true, nil
 	}
 	// fee - it's collateral for batch, get from SC in matic
-	fee, err := c.EthMan.GetSendSequenceFee()
+	fee, err := c.EthMan.GetSendSequenceFee(1)
 	if err != nil {
 		return false, err
 	}
@@ -43,6 +44,8 @@ func (c *Checker) IsSequenceProfitable(ctx context.Context, sequence state.Seque
 	for _, tx := range sequence.Txs {
 		reward.Add(reward, new(big.Int).Mul(tx.GasPrice(), new(big.Int).SetUint64(tx.Gas())))
 	}
+
+	metrics.SequenceRewardInMatic(float64(reward.Int64()))
 
 	// get price of matic (1 eth = x matic)
 	price, err := c.PriceGetter.GetEthToMaticPrice(ctx)
@@ -59,11 +62,13 @@ func (c *Checker) IsSequenceProfitable(ctx context.Context, sequence state.Seque
 		return false, nil
 	}
 
+	metrics.EthToMaticPrice(float64(priceInt.Int64()))
+
 	return true, nil
 }
 
 // IsSendSequencesProfitable checks profitability to send sequences to the ethereum
-func (c *Checker) IsSendSequencesProfitable(estimatedGas *big.Int, sequences []state.Sequence) bool {
+func (c *Checker) IsSendSequencesProfitable(estimatedGas *big.Int, sequences []types.Sequence) bool {
 	if len(sequences) == 0 {
 		return false
 	}
