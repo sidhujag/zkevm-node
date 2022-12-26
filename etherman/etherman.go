@@ -310,6 +310,19 @@ func (etherMan *Client) sequenceBatches(opts *bind.TransactOpts, sequences []sta
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode transactions, err: %v", err)
 		}
+		// SYSCOIN
+		/*  
+		 batchL2Data + globalExitRoot + msg.sender to create blob and make batchL2Data[0:32] = VH*/
+		// if NoSend is true then just fill in random VH to estimate gas
+		// put batchL2Data in PoDA and replace with VH's
+		batchHashData := make([]byte, 0)
+		batchHashData = append(batchHashData, batchL2Data...)
+		batchHashData = append(batchHashData, seq.GlobalExitRoot[:]...)
+		pubAddr, err := etherMan.GetPublicAddress()
+		if err != nil {
+			return nil, err
+		}
+		batchHashData = append(batchHashData, pubAddr[:]...)
 		batch := proofofefficiency.ProofOfEfficiencyBatchData{
 			Transactions:          batchL2Data,
 			GlobalExitRoot:        seq.GlobalExitRoot,
@@ -498,7 +511,33 @@ func decodeSequences(txData []byte, lastBatchNumber uint64, sequencer common.Add
 	if err != nil {
 		return nil, err
 	}
-
+	// SYSCOIN sequences will have VH's here, run through them grab the data from indexer and put them back into sequence object
+	/*
+		Transactions := make([][]byte, 0)
+		for j := 0; j < len(sequences); j++ {
+			numVHs := len(sequences[j].Transactions)/32
+			sequences[j].Transactions = make([]byte, 0)
+			for i := 0; i < numVHs; i++ {
+				// get version hash from calldata and lookup data via syscoinclient
+				vhBytes := sequences[j].Transactions[i*32:(i+1)*32]
+				// 1. get data from syscoin rpc
+				vh := common.BytesToHash(vhBytes)
+				dataBlob, err := fetcher.GetBlobFromRPC(vh)
+				if err != nil {
+					// 2. if not get it from archiving service
+					data, err = fetcher.GetBlobFromCloud(vh)
+					if err != nil {
+						log.Warn("DataFromEVMTransactions", "failed to fetch L1 block info and receipts", err)
+						return nil
+					}
+				}
+				// rehash to ensure vh is the hash of dataBlob
+				common.BytesToHash(keccak256.Hash(dataBlob)) == vh
+				// read until globalExitRoot (32 bytes) and address (20 bytes) for transactions
+				sequences[j].Transactions = append(sequences[j].Transactions, dataBlob[:52])
+			}
+		}
+		*/
 	sequencedBatches := make([]SequencedBatch, len(sequences))
 	for i := len(sequences) - 1; i >= 0; i-- {
 		lastBatchNumber -= uint64(len(sequences[i].ForceBatchesTimestamp))
