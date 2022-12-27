@@ -336,21 +336,10 @@ func (etherMan *Client) sequenceBatches(opts *bind.TransactOpts, sequences []eth
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode transactions, err: %v", err)
 		}
-		// SYSCOIN
-		/*  
-		 batchL2Data + globalExitRoot + msg.sender to create blob and make batchL2Data[0:32] = VH*/
-		// if NoSend is true then just fill in random VH to estimate gas
-		// put batchL2Data in PoDA and replace with VH's
-		batchHashData := make([]byte, 0)
-		batchHashData = append(batchHashData, batchL2Data...)
-		batchHashData = append(batchHashData, seq.GlobalExitRoot[:]...)
-		pubAddr, err := etherMan.GetPublicAddress()
-		if err != nil {
-			return nil, err
-		}
-		batchHashData = append(batchHashData, pubAddr[:]...)
+		// SYSCOIN TODO send blob to PoDA wait for confirm
 		batch := proofofefficiency.ProofOfEfficiencyBatchData{
-			Transactions:       batchL2Data,
+			// SYSCOIN replace batch data with hash which is checked in the contract (PoDA)
+			Transactions:       crypto.Keccak256(batchL2Data),
 			GlobalExitRoot:     seq.GlobalExitRoot,
 			Timestamp:          uint64(seq.Timestamp),
 			MinForcedTimestamp: 0, // TODO If this batch is forced, this value must be different to zero. If it is a non forced sequence, then the valio will be valid
@@ -501,10 +490,13 @@ func (etherMan *Client) forcedBatchEvent(ctx context.Context, vLog types.Log, bl
 			return err
 		}
 		bytedata := data[0].([]byte)
-		forcedBatch.RawTxsData = bytedata
+		// SYSCOIN
+		forcedBatch.RawTxsData = crypto.Keccak256(bytedata)
 	} else {
-		forcedBatch.RawTxsData = fb.Transactions
+		// SYSCOIN
+		forcedBatch.RawTxsData = crypto.Keccak256(fb.Transactions)
 	}
+	// SYSCOIN TODO send blob to PoDA wait for confirm
 	forcedBatch.Sequencer = fb.Sequencer
 	fullBlock, err := etherMan.EtherClient.BlockByHash(ctx, vLog.BlockHash)
 	if err != nil {
@@ -605,31 +597,25 @@ func decodeSequences(txData []byte, lastBatchNumber uint64, sequencer common.Add
 	}
 	// SYSCOIN sequences will have VH's here, run through them grab the data from indexer and put them back into sequence object
 	/*
-		Transactions := make([][]byte, 0)
 		for j := 0; j < len(sequences); j++ {
-			numVHs := len(sequences[j].Transactions)/32
-			sequences[j].Transactions = make([]byte, 0)
-			for i := 0; i < numVHs; i++ {
-				// get version hash from calldata and lookup data via syscoinclient
-				vhBytes := sequences[j].Transactions[i*32:(i+1)*32]
-				// 1. get data from syscoin rpc
-				vh := common.BytesToHash(vhBytes)
-				dataBlob, err := fetcher.GetBlobFromRPC(vh)
+			// 1. get data from syscoin rpc
+			vh := common.BytesToHash(sequences[j].Transactions)
+			dataBlob, err := fetcher.GetBlobFromRPC(vh)
+			if err != nil {
+				// 2. if not get it from archiving service
+				dataBlob, err = fetcher.GetBlobFromCloud(vh)
 				if err != nil {
-					// 2. if not get it from archiving service
-					data, err = fetcher.GetBlobFromCloud(vh)
-					if err != nil {
-						log.Warn("DataFromEVMTransactions", "failed to fetch L1 block info and receipts", err)
-						return nil
-					}
+					log.Warn("decodeSequences", "failed to fetch L1 block info and receipts", err)
+					return nil, err
 				}
-				// rehash to ensure vh is the hash of dataBlob
-				common.BytesToHash(keccak256.Hash(dataBlob)) == vh
-				// read until globalExitRoot (32 bytes) and address (20 bytes) for transactions
-				sequences[j].Transactions = append(sequences[j].Transactions, dataBlob[:52])
 			}
+			// rehash to ensure vh is the hash of dataBlob
+			if(crypto.Keccak256Hash(dataBlob) != vh {
+				return nil, err
+			}
+			sequences[j].Transactions = dataBlob
 		}
-		*/
+	*/
 	sequencedBatches := make([]SequencedBatch, len(sequences))
 	for i, seq := range sequences {
 		bn := lastBatchNumber - uint64(len(sequences)-(i+1))
@@ -755,7 +741,27 @@ func decodeSequencedForceBatches(txData []byte, lastBatchNumber uint64, sequence
 	if err != nil {
 		return nil, err
 	}
-
+	// SYSCOIN sequences will have VH's here, run through them grab the data from indexer and put them back into sequence object
+	/*
+		for j := 0; j < len(forceBatches); j++ {
+			// 1. get data from syscoin rpc
+			vh := common.BytesToHash(forceBatches[j].Transactions)
+			dataBlob, err := fetcher.GetBlobFromRPC(vh)
+			if err != nil {
+				// 2. if not get it from archiving service
+				dataBlob, err = fetcher.GetBlobFromCloud(vh)
+				if err != nil {
+					log.Warn("decodeSequences", "failed to fetch L1 block info and receipts", err)
+					return nil, err
+				}
+			}
+			// rehash to ensure vh is the hash of dataBlob
+			if(crypto.Keccak256Hash(dataBlob) != vh {
+				return nil, err
+			}
+			forceBatches[j].Transactions = dataBlob
+		}
+	*/
 	sequencedForcedBatches := make([]SequencedForceBatch, len(forceBatches))
 	for i, force := range forceBatches {
 		bn := lastBatchNumber - uint64(len(forceBatches)-(i+1))

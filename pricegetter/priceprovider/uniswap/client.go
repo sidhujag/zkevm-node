@@ -13,6 +13,7 @@ import (
 
 var (
 	x96                        = new(big.Float).SetInt(big.NewInt(0).Exp(big.NewInt(2), big.NewInt(96), nil)) // nolint:gomnd
+	// SYSCOIN TODO PSYS contract
 	uniswapAddressEthMaticPool = common.HexToAddress("0x290a6a7460b308ee3f19023d2d00de604bcf5b42")
 )
 
