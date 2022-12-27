@@ -30,10 +30,10 @@ var (
 
 // ProofOfEfficiencyBatchData is an auto generated low-level Go binding around an user-defined struct.
 type ProofOfEfficiencyBatchData struct {
+	Transactions       []byte
 	GlobalExitRoot     [32]byte
 	Timestamp          uint64
 	MinForcedTimestamp uint64
-	Transactions       []byte
 }
 
 // ProofOfEfficiencyForcedBatchData is an auto generated low-level Go binding around an user-defined struct.
