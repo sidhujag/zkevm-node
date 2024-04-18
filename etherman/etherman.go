@@ -104,6 +104,8 @@ type Client struct {
 	GasProviders externalGasProviders
 
 	auth *bind.TransactOpts // nil in case of read-only client
+	// SYSCOIN
+	SyscoinClient		  SyscoinClient
 }
 
 // NewClient creates a new etherman.
@@ -140,7 +142,11 @@ func NewClient(cfg Config, auth *bind.TransactOpts) (*Client, error) {
 		}
 		gProviders = append(gProviders, ethgasstation.NewEthGasStationService())
 	}
-
+	// SYSCOIN
+	sysClient, err := NewSyscoinClient("", "")
+	if err != nil {
+		return nil, fmt.Errorf("Could not create Syscoin RPC client: %w", err)
+	}
 	return &Client{
 		EtherClient:           ethClient,
 		PoE:                   poe,
@@ -152,6 +158,8 @@ func NewClient(cfg Config, auth *bind.TransactOpts) (*Client, error) {
 			Providers:        gProviders,
 		},
 		auth: auth,
+		// SYSCOIN
+		SyscoinClient: sysClient,
 	}, nil
 }
 
@@ -540,7 +548,8 @@ func (etherMan *Client) sequencedBatchesEvent(ctx context.Context, vLog types.Lo
 	if err != nil {
 		return err
 	}
-	sequences, err := decodeSequences(tx.Data(), sb.NumBatch, msg.From(), vLog.TxHash, msg.Nonce())
+	// SYSCOIN
+	sequences, err := decodeSequences(tx.Data(), sb.NumBatch, msg.From(), vLog.TxHash, msg.Nonce(), &SyscoinClient)
 	if err != nil {
 		return fmt.Errorf("error decoding the sequences: %v", err)
 	}
@@ -566,8 +575,8 @@ func (etherMan *Client) sequencedBatchesEvent(ctx context.Context, vLog types.Lo
 	(*blocksOrder)[(*blocks)[len(*blocks)-1].BlockHash] = append((*blocksOrder)[(*blocks)[len(*blocks)-1].BlockHash], or)
 	return nil
 }
-
-func decodeSequences(txData []byte, lastBatchNumber uint64, sequencer common.Address, txHash common.Hash, nonce uint64) ([]SequencedBatch, error) {
+// SYSCOIN
+func decodeSequences(txData []byte, lastBatchNumber uint64, sequencer common.Address, txHash common.Hash, nonce uint64, fetcher* SyscoinClient) ([]SequencedBatch, error) {
 	// Extract coded txs.
 	// Load contract ABI
 	abi, err := abi.JSON(strings.NewReader(proofofefficiency.ProofofefficiencyABI))
@@ -596,7 +605,7 @@ func decodeSequences(txData []byte, lastBatchNumber uint64, sequencer common.Add
 		return nil, err
 	}
 	// SYSCOIN sequences will have VH's here, run through them grab the data from indexer and put them back into sequence object
-	/*
+	
 		for j := 0; j < len(sequences); j++ {
 			// 1. get data from syscoin rpc
 			vh := common.BytesToHash(sequences[j].Transactions)
@@ -615,7 +624,7 @@ func decodeSequences(txData []byte, lastBatchNumber uint64, sequencer common.Add
 			}
 			sequences[j].Transactions = dataBlob
 		}
-	*/
+	
 	sequencedBatches := make([]SequencedBatch, len(sequences))
 	for i, seq := range sequences {
 		bn := lastBatchNumber - uint64(len(sequences)-(i+1))
@@ -688,7 +697,8 @@ func (etherMan *Client) forceSequencedBatchesEvent(ctx context.Context, vLog typ
 	if err != nil {
 		return fmt.Errorf("error getting hashParent. BlockNumber: %d. Error: %w", vLog.BlockNumber, err)
 	}
-	sequencedForceBatch, err := decodeSequencedForceBatches(tx.Data(), fsb.NumBatch, msg.From(), vLog.TxHash, fullBlock, msg.Nonce())
+	// SYSCOIN
+	sequencedForceBatch, err := decodeSequencedForceBatches(tx.Data(), fsb.NumBatch, msg.From(), vLog.TxHash, fullBlock, msg.Nonce(), &SyscoinClient)
 	if err != nil {
 		return err
 	}
@@ -711,8 +721,8 @@ func (etherMan *Client) forceSequencedBatchesEvent(ctx context.Context, vLog typ
 
 	return nil
 }
-
-func decodeSequencedForceBatches(txData []byte, lastBatchNumber uint64, sequencer common.Address, txHash common.Hash, block *types.Block, nonce uint64) ([]SequencedForceBatch, error) {
+// SYSCOIN
+func decodeSequencedForceBatches(txData []byte, lastBatchNumber uint64, sequencer common.Address, txHash common.Hash, block *types.Block, nonce uint64, fetcher* SyscoinClient) ([]SequencedForceBatch, error) {
 	// Extract coded txs.
 	// Load contract ABI
 	abi, err := abi.JSON(strings.NewReader(proofofefficiency.ProofofefficiencyABI))
@@ -742,26 +752,25 @@ func decodeSequencedForceBatches(txData []byte, lastBatchNumber uint64, sequence
 		return nil, err
 	}
 	// SYSCOIN sequences will have VH's here, run through them grab the data from indexer and put them back into sequence object
-	/*
-		for j := 0; j < len(forceBatches); j++ {
-			// 1. get data from syscoin rpc
-			vh := common.BytesToHash(forceBatches[j].Transactions)
-			dataBlob, err := fetcher.GetBlobFromRPC(vh)
+	for j := 0; j < len(forceBatches); j++ {
+		// 1. get data from syscoin rpc
+		vh := common.BytesToHash(forceBatches[j].Transactions)
+		dataBlob, err := fetcher.GetBlobFromRPC(vh)
+		if err != nil {
+			// 2. if not get it from archiving service
+			dataBlob, err = fetcher.GetBlobFromCloud(vh)
 			if err != nil {
-				// 2. if not get it from archiving service
-				dataBlob, err = fetcher.GetBlobFromCloud(vh)
-				if err != nil {
-					log.Warn("decodeSequences", "failed to fetch L1 block info and receipts", err)
-					return nil, err
-				}
-			}
-			// rehash to ensure vh is the hash of dataBlob
-			if(crypto.Keccak256Hash(dataBlob) != vh {
+				log.Warn("decodeSequences", "failed to fetch L1 block info and receipts", err)
 				return nil, err
 			}
-			forceBatches[j].Transactions = dataBlob
 		}
-	*/
+		// rehash to ensure vh is the hash of dataBlob
+		if(crypto.Keccak256Hash(dataBlob) != vh {
+			return nil, err
+		}
+		forceBatches[j].Transactions = dataBlob
+	}
+	
 	sequencedForcedBatches := make([]SequencedForceBatch, len(forceBatches))
 	for i, force := range forceBatches {
 		bn := lastBatchNumber - uint64(len(forceBatches)-(i+1))

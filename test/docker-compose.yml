@@ -3,6 +3,17 @@ networks:
   default:
     name: zkevm
 services:
+  l1:
+    build:
+      context: .
+      dockerfile: Dockerfile.l1
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    ports:
+      - "9545:8545"
+    volumes:
+      - "l1_data:/db/.syscoin"
+
   grafana:
     container_name: grafana
     image: grafana/grafana-oss
@@ -46,6 +57,8 @@ services:
       - POSTGRES_DB=grafana
 
   zkevm-sequencer:
+    depends_on:
+      - l1
     container_name: zkevm-sequencer
     image: zkevm-node
     ports:
@@ -61,7 +74,11 @@ services:
       - "/bin/sh"
       - "-c"
       - "/app/zkevm-node run --genesis /app/genesis.json --cfg /app/config.toml --components sequencer"
-
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+      - 192.168.9.45
+  
   zkevm-json-rpc:
     container_name: zkevm-json-rpc
     image: zkevm-node
@@ -116,6 +133,8 @@ services:
       - "/app/zkevm-node run --genesis /app/genesis.json --cfg /app/config.toml --components aggregator"
 
   zkevm-sync:
+    depends_on:
+      - l1
     container_name: zkevm-sync
     image: zkevm-node
     environment:
@@ -128,7 +147,11 @@ services:
       - "/bin/sh"
       - "-c"
       - "/app/zkevm-node run --genesis /app/genesis.json --cfg /app/config.toml --components synchronizer"
-
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+      - 192.168.9.45
+  
   zkevm-broadcast:
     container_name: zkevm-broadcast
     image: zkevm-node
@@ -322,6 +345,8 @@ services:
     command: ["postgres", "-N", "500"]
 
   zkevm-permissionless-node:
+    depends_on:
+      - l1
     container_name: zkevm-permissionless-node
     image: zkevm-node
     ports:
@@ -346,7 +371,11 @@ services:
       - "/bin/sh"
       - "-c"
       - "/app/zkevm-node run --genesis /app/genesis.json --cfg /app/config.toml --components \"rpc,synchronizer\""
-
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+      - 192.168.9.45
+  
   zkevm-metrics:
     image: prom/prometheus:v2.39.1
     container_name: zkevm-metrics
@@ -358,3 +387,12 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ../config/metrics/prometheus:/etc/prometheus
+
+networks:
+  default:
+      driver: bridge
+      ipam:
+          driver: default
+          config:
+            - subnet: 192.168.0.0/16
+              gateway: 192.168.0.1
