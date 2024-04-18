@@ -3,30 +3,39 @@ package jsonrpc
 import (
 	"context"
 
+	"github.com/0xPolygonHermez/zkevm-node/jsonrpc/types"
 	"github.com/jackc/pgx/v4"
 )
 
-type dbTxManager struct{}
+// DBTxManager allows to do scopped DB txs
+type DBTxManager struct{}
 
-type dbTxScopedFn func(ctx context.Context, dbTx pgx.Tx) (interface{}, rpcError)
+// DBTxScopedFn function to do scopped DB txs
+type DBTxScopedFn func(ctx context.Context, dbTx pgx.Tx) (interface{}, types.Error)
 
-func (f *dbTxManager) NewDbTxScope(st stateInterface, scopedFn dbTxScopedFn) (interface{}, rpcError) {
+// DBTxer interface to begin DB txs
+type DBTxer interface {
+	BeginStateTransaction(ctx context.Context) (pgx.Tx, error)
+}
+
+// NewDbTxScope function to initiate DB scopped txs
+func (f *DBTxManager) NewDbTxScope(db DBTxer, scopedFn DBTxScopedFn) (interface{}, types.Error) {
 	ctx := context.Background()
-	dbTx, err := st.BeginStateTransaction(ctx)
+	dbTx, err := db.BeginStateTransaction(ctx)
 	if err != nil {
-		return rpcErrorResponse(defaultErrorCode, "failed to connect to the state", err)
+		return RPCErrorResponse(types.DefaultErrorCode, "failed to connect to the state", err, true)
 	}
 
 	v, rpcErr := scopedFn(ctx, dbTx)
 	if rpcErr != nil {
 		if txErr := dbTx.Rollback(context.Background()); txErr != nil {
-			return rpcErrorResponse(defaultErrorCode, "failed to rollback db transaction", txErr)
+			return RPCErrorResponse(types.DefaultErrorCode, "failed to rollback db transaction", txErr, true)
 		}
 		return v, rpcErr
 	}
 
 	if txErr := dbTx.Commit(context.Background()); txErr != nil {
-		return rpcErrorResponse(defaultErrorCode, "failed to commit db transaction", txErr)
+		return RPCErrorResponse(types.DefaultErrorCode, "failed to commit db transaction", txErr, true)
 	}
 	return v, rpcErr
 }

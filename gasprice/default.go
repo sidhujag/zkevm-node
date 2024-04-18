@@ -2,44 +2,46 @@ package gasprice
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/big"
-
-	"github.com/0xPolygonHermez/zkevm-node/state"
 )
 
-// Default gas price from config is set.
-type Default struct {
-	cfg  Config
-	pool pool
+// DefaultGasPricer gas price from config is set.
+type DefaultGasPricer struct {
+	cfg        Config
+	pool       poolInterface
+	ctx        context.Context
+	l1GasPrice uint64
 }
 
-// GetAvgGasPrice get default gas price from the pool.
-func (d *Default) GetAvgGasPrice(ctx context.Context) (*big.Int, error) {
-	gasPrice, err := d.pool.GetGasPrice(ctx)
-	if errors.Is(err, state.ErrNotFound) {
-		return big.NewInt(0), nil
-	} else if err != nil {
-		return nil, err
+// newDefaultGasPriceSuggester init default gas price suggester.
+func newDefaultGasPriceSuggester(ctx context.Context, cfg Config, pool poolInterface) *DefaultGasPricer {
+	// Apply factor to calculate l1 gasPrice
+	factorAsPercentage := int64(cfg.Factor * 100) // nolint:gomnd
+	factor := big.NewInt(factorAsPercentage)
+	defaultGasPriceDivByFactor := new(big.Int).Div(new(big.Int).SetUint64(cfg.DefaultGasPriceWei), factor)
+
+	gpe := &DefaultGasPricer{
+		ctx:        ctx,
+		cfg:        cfg,
+		pool:       pool,
+		l1GasPrice: new(big.Int).Mul(defaultGasPriceDivByFactor, big.NewInt(100)).Uint64(), // nolint:gomnd
 	}
-	return new(big.Int).SetUint64(gasPrice), nil
+	gpe.setDefaultGasPrice()
+	return gpe
 }
 
 // UpdateGasPriceAvg not needed for default strategy.
-func (d *Default) UpdateGasPriceAvg(newValue *big.Int) {}
-
-func (d *Default) setDefaultGasPrice() {
-	ctx := context.Background()
-	err := d.pool.SetGasPrice(ctx, d.cfg.DefaultGasPriceWei)
+func (d *DefaultGasPricer) UpdateGasPriceAvg() {
+	err := d.pool.SetGasPrices(d.ctx, d.cfg.DefaultGasPriceWei, d.l1GasPrice)
 	if err != nil {
 		panic(fmt.Errorf("failed to set default gas price, err: %v", err))
 	}
 }
 
-// NewDefaultEstimator init default gas price estimator.
-func NewDefaultEstimator(cfg Config, pool pool) *Default {
-	gpe := &Default{cfg: cfg, pool: pool}
-	gpe.setDefaultGasPrice()
-	return gpe
+func (d *DefaultGasPricer) setDefaultGasPrice() {
+	err := d.pool.SetGasPrices(d.ctx, d.cfg.DefaultGasPriceWei, d.l1GasPrice)
+	if err != nil {
+		panic(fmt.Errorf("failed to set default gas price, err: %v", err))
+	}
 }

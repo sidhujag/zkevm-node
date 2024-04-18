@@ -10,8 +10,19 @@
 /test/contracts/bin/**/*.bin
 /test/contracts/bin/**/*.abi
 
+/tools/datastreamer/*.bin
+/test/datastreamer/*.db/*
+/test/*.bin
+/test/*.db/*
+
 **/.DS_Store
 .vscode
 .idea/
-
+.env
 out.dat
+
+cmd/__debug_bin
+
+.venv
+
+*metrics.txt

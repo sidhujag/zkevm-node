@@ -111,6 +111,28 @@ func GaugeSet(name string, value float64) {
 	}
 }
 
+// GaugeInc increments the gauge with the given name.
+func GaugeInc(name string) {
+	if !initialized {
+		return
+	}
+
+	if g, ok := Gauge(name); ok {
+		g.Inc()
+	}
+}
+
+// GaugeDec decrements the gauge with the given name.
+func GaugeDec(name string) {
+	if !initialized {
+		return
+	}
+
+	if g, ok := Gauge(name); ok {
+		g.Dec()
+	}
+}
+
 // RegisterCounters registers the provided counter metrics to the Prometheus
 // registerer.
 func RegisterCounters(opts ...prometheus.CounterOpts) {
@@ -450,7 +472,7 @@ func unregisterGaugeIfExists(name string) {
 func registerCounterIfNotExists(opts prometheus.CounterOpts) {
 	log := log.WithFields("metricName", opts.Name)
 	if _, exist := counters[opts.Name]; exist {
-		log.Warn("Counter metric already exists.")
+		log.Infof("Counter metric already exists. %s", opts.Name)
 		return
 	}
 
@@ -534,7 +556,7 @@ func unregisterCounterVecIfExists(name string) {
 func registerHistogramIfNotExists(opts prometheus.HistogramOpts) {
 	log := log.WithFields("metricName", opts.Name)
 	if _, exist := histograms[opts.Name]; exist {
-		log.Warn("Histogram metric already exists.")
+		log.Infof("Histogram metric already exists. %s", opts.Name)
 		return
 	}
 

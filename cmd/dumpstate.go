@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 
 	"github.com/0xPolygonHermez/zkevm-node/config"
 	"github.com/0xPolygonHermez/zkevm-node/db"
 	"github.com/0xPolygonHermez/zkevm-node/state"
+	"github.com/0xPolygonHermez/zkevm-node/state/pgstatestorage"
 	"github.com/urfave/cli/v2"
 )
 
@@ -34,6 +35,7 @@ var dumpStateFlags = []cli.Flag{
 		Required: true,
 	},
 	&configFileFlag,
+	&networkFlag,
 }
 
 type dumpedState struct {
@@ -96,7 +98,7 @@ func (b *batch) MarshalJSON() ([]byte, error) {
 
 func dumpState(ctx *cli.Context) error {
 	// Load config
-	c, err := config.Load(ctx)
+	c, err := config.Load(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -104,15 +106,15 @@ func dumpState(ctx *cli.Context) error {
 	description := ctx.String(dumpStateFlagDescription)
 	outputFile := ctx.String(dumpStateFlagOutput)
 	if !strings.Contains(outputFile, ".json") {
-		return errors.New("Output file must end in .json")
+		return errors.New("output file must end in .json")
 	}
 
 	// Connect to SQL
-	stateSqlDB, err := db.NewSQLDB(c.StateDB)
+	stateSqlDB, err := db.NewSQLDB(c.State.DB)
 	if err != nil {
 		return err
 	}
-	stateDB := state.NewPostgresStorage(stateSqlDB)
+	stateDB := pgstatestorage.NewPostgresStorage(state.Config{}, stateSqlDB)
 
 	dump := dumpedState{
 		Description: description,
@@ -158,5 +160,5 @@ func dumpState(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(outputFile, file, 0600) //nolint:gomnd
+	return os.WriteFile(outputFile, file, 0600) //nolint:gomnd
 }

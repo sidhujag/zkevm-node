@@ -6,7 +6,7 @@ Configuring each DB is trivial if done with an orchestration tool such as Docker
 
 The following are examples on how one would provision each DB to serve along the components (rpc, aggregator, sequencer...)
 
-Note the `enviroment` values will change per DB.
+Note the `environment` values will change per DB.
 
 - **StateDB**:
 
@@ -17,7 +17,7 @@ This is done via an sql file: [init_prover_db.sql](https://github.com/0xPolygonH
 ```yaml
 zkevm-state-db:
     container_name: zkevm-state-db
-    image: postgres
+    image: postgres:15
     deploy:
       resources:
         limits:
@@ -40,7 +40,7 @@ zkevm-state-db:
 ```yaml
   zkevm-pool-db:
     container_name: zkevm-pool-db
-    image: postgres
+    image: postgres:15
     deploy:
       resources:
         limits:

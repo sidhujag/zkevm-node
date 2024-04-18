@@ -1,22 +1,19 @@
 package etherman
 
-import (
-	"github.com/0xPolygonHermez/zkevm-node/etherman/etherscan"
-	"github.com/ethereum/go-ethereum/common"
-)
+import "github.com/0xPolygonHermez/zkevm-node/etherman/etherscan"
 
 // Config represents the configuration of the etherman
 type Config struct {
-	URL       string `mapstructure:"URL"`
-	L1ChainID uint64 `mapstructure:"L1ChainID"`
+	// URL is the URL of the Ethereum node for L1
+	URL string `mapstructure:"URL"`
+	// ConsensusL1URL is the URL of the consensus L1 RPC endpoint
+	ConsensusL1URL string `mapstructure:"ConsensusL1URL"`
 
-	PoEAddr                   common.Address `mapstructure:"PoEAddr"`
-	MaticAddr                 common.Address `mapstructure:"MaticAddr"`
-	GlobalExitRootManagerAddr common.Address `mapstructure:"GlobalExitRootManagerAddr"`
+	// ForkIDChunkSize is the max interval for each call to L1 provider to get the forkIDs
+	ForkIDChunkSize uint64 `mapstructure:"ForkIDChunkSize"`
 
-	PrivateKeyPath     string `mapstructure:"PrivateKeyPath"`
-	PrivateKeyPassword string `mapstructure:"PrivateKeyPassword"`
-
+	// allow that L1 gas price calculation use multiples sources
 	MultiGasProvider bool `mapstructure:"MultiGasProvider"`
-	Etherscan        etherscan.Config
+	// Configuration for use Etherscan as used as gas provider, basically it needs the API-KEY
+	Etherscan etherscan.Config
 }

@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xPolygonHermez/zkevm-node/aggregator"
 	"github.com/0xPolygonHermez/zkevm-node/config"
 	"github.com/0xPolygonHermez/zkevm-node/config/types"
 	"github.com/0xPolygonHermez/zkevm-node/log"
-	"github.com/0xPolygonHermez/zkevm-node/pricegetter"
-	"github.com/0xPolygonHermez/zkevm-node/sequencer"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v2"
 )
@@ -30,7 +30,7 @@ func Test_Defaults(t *testing.T) {
 		},
 		{
 			path:          "Log.Level",
-			expectedValue: "debug",
+			expectedValue: "info",
 		},
 		{
 			path:          "Log.Outputs",
@@ -41,143 +41,164 @@ func Test_Defaults(t *testing.T) {
 			expectedValue: uint64(100),
 		},
 		{
-			path:          "PriceGetter.Type",
-			expectedValue: pricegetter.DefaultType,
+			path:          "Synchronizer.L1SynchronizationMode",
+			expectedValue: "sequential",
 		},
 		{
-			path:          "PriceGetter.DefaultPrice",
-			expectedValue: pricegetter.TokenPrice{Float: new(big.Float).SetInt64(2000)},
-		},
-		{
-			path:          "Sequencer.WaitPeriodPoolIsEmpty",
-			expectedValue: types.NewDuration(1 * time.Second),
-		},
-		{
-			path:          "Sequencer.LastBatchVirtualizationTimeMaxWaitPeriod",
-			expectedValue: types.NewDuration(300 * time.Second),
-		},
-		{
-			path:          "Sequencer.WaitBlocksToUpdateGER",
+			path:          "Synchronizer.L1ParallelSynchronization.MaxClients",
 			expectedValue: uint64(10),
 		},
 		{
-			path:          "Sequencer.WaitBlocksToConsiderGerFinal",
-			expectedValue: uint64(10),
+			path:          "Synchronizer.L1ParallelSynchronization.MaxPendingNoProcessedBlocks",
+			expectedValue: uint64(25),
 		},
 		{
-			path:          "Sequencer.MaxTxsPerBatch",
-			expectedValue: uint64(150),
+			path:          "Synchronizer.L2Synchronization.AcceptEmptyClosedBatches",
+			expectedValue: false,
 		},
 		{
-			path:          "Sequencer.MaxBatchBytesSize",
-			expectedValue: 150000,
-		},
-		{
-			path:          "Sequencer.MaxTimeForBatchToBeOpen",
-			expectedValue: types.NewDuration(15 * time.Second),
-		},
-		{
-			path:          "Sequencer.ElapsedTimeToCloseBatchWithoutTxsDueToNewGER",
-			expectedValue: types.NewDuration(60 * time.Second),
-		},
-		{
-			path:          "Sequencer.BlocksAmountForTxsToBeDeleted",
-			expectedValue: uint64(100),
-		},
-		{
-			path:          "Sequencer.FrequencyToCheckTxsForDelete",
-			expectedValue: types.NewDuration(12 * time.Hour),
-		},
-		{
-			path:          "Sequencer.ProfitabilityChecker.SendBatchesEvenWhenNotProfitable",
+			path:          "Synchronizer.L2Synchronization.ReprocessFullBatchOnClose",
 			expectedValue: true,
 		},
 		{
-			path:          "Sequencer.MaxCumulativeGasUsed",
-			expectedValue: uint64(30000000),
+			path:          "Synchronizer.L2Synchronization.CheckLastL2BlockHashOnCloseBatch",
+			expectedValue: true,
+		},
+
+		{
+			path:          "Sequencer.DeletePoolTxsL1BlockConfirmations",
+			expectedValue: uint64(100),
 		},
 		{
-			path:          "Sequencer.MaxKeccakHashes",
-			expectedValue: int32(468),
+			path:          "Sequencer.DeletePoolTxsCheckInterval",
+			expectedValue: types.NewDuration(12 * time.Hour),
 		},
 		{
-			path:          "Sequencer.MaxPoseidonHashes",
-			expectedValue: int32(279620),
+			path:          "Sequencer.TxLifetimeCheckInterval",
+			expectedValue: types.NewDuration(10 * time.Minute),
 		},
 		{
-			path:          "Sequencer.MaxPoseidonPaddings",
-			expectedValue: int32(149796),
+			path:          "Sequencer.TxLifetimeMax",
+			expectedValue: types.NewDuration(3 * time.Hour),
 		},
 		{
-			path:          "Sequencer.MaxMemAligns",
-			expectedValue: int32(262144),
+			path:          "Sequencer.LoadPoolTxsCheckInterval",
+			expectedValue: types.NewDuration(500 * time.Millisecond),
 		},
 		{
-			path:          "Sequencer.MaxArithmetics",
-			expectedValue: int32(262144),
+			path:          "Sequencer.StateConsistencyCheckInterval",
+			expectedValue: types.NewDuration(5 * time.Second),
 		},
 		{
-			path:          "Sequencer.MaxBinaries",
-			expectedValue: int32(262144),
+			path:          "Sequencer.Finalizer.ForcedBatchesTimeout",
+			expectedValue: types.NewDuration(60 * time.Second),
 		},
 		{
-			path:          "Sequencer.MaxSteps",
-			expectedValue: int32(8388608),
+			path:          "Sequencer.Finalizer.NewTxsWaitInterval",
+			expectedValue: types.NewDuration(100 * time.Millisecond),
 		},
 		{
-			path:          "Sequencer.MaxSequenceSize",
-			expectedValue: sequencer.MaxSequenceSize{Int: new(big.Int).SetInt64(2000000)},
+			path:          "Sequencer.Finalizer.ResourceExhaustedMarginPct",
+			expectedValue: uint32(10),
 		},
 		{
-			path:          "Sequencer.MaxAllowedFailedCounter",
-			expectedValue: uint64(50),
+			path:          "Sequencer.Finalizer.ForcedBatchesL1BlockConfirmations",
+			expectedValue: uint64(64),
+		},
+		{
+			path:          "Sequencer.Finalizer.L1InfoTreeL1BlockConfirmations",
+			expectedValue: uint64(64),
+		},
+		{
+			path:          "Sequencer.Finalizer.ForcedBatchesCheckInterval",
+			expectedValue: types.NewDuration(10 * time.Second),
+		},
+		{
+			path:          "Sequencer.Finalizer.L1InfoTreeCheckInterval",
+			expectedValue: types.NewDuration(10 * time.Second),
+		},
+		{
+			path:          "Sequencer.Finalizer.L2BlockMaxDeltaTimestamp",
+			expectedValue: types.NewDuration(3 * time.Second),
+		},
+		{
+			path:          "Sequencer.Finalizer.HaltOnBatchNumber",
+			expectedValue: uint64(0),
+		},
+		{
+			path:          "Sequencer.Finalizer.BatchMaxDeltaTimestamp",
+			expectedValue: types.NewDuration(10 * time.Second),
+		},
+		{
+			path:          "Sequencer.Finalizer.Metrics.Interval",
+			expectedValue: types.NewDuration(60 * time.Minute),
+		},
+		{
+			path:          "Sequencer.Finalizer.Metrics.EnableLog",
+			expectedValue: true,
+		},
+		{
+			path:          "Sequencer.StreamServer.Port",
+			expectedValue: uint16(0),
+		},
+		{
+			path:          "Sequencer.StreamServer.Filename",
+			expectedValue: "",
+		},
+		{
+			path:          "Sequencer.StreamServer.Version",
+			expectedValue: uint8(0),
+		},
+		{
+			path:          "Sequencer.StreamServer.Enabled",
+			expectedValue: false,
+		},
+		{
+			path:          "SequenceSender.WaitPeriodSendSequence",
+			expectedValue: types.NewDuration(5 * time.Second),
+		},
+		{
+			path:          "SequenceSender.LastBatchVirtualizationTimeMaxWaitPeriod",
+			expectedValue: types.NewDuration(5 * time.Second),
+		},
+		{
+			path:          "SequenceSender.L1BlockTimestampMargin",
+			expectedValue: types.NewDuration(30 * time.Second),
+		},
+		{
+			path:          "SequenceSender.MaxTxSizeForL1",
+			expectedValue: uint64(131072),
+		},
+		{
+			path:          "SequenceSender.GasOffset",
+			expectedValue: uint64(80000),
 		},
 		{
 			path:          "Etherman.URL",
 			expectedValue: "http://localhost:8545",
 		},
 		{
-			path:          "Etherman.L1ChainID",
-			expectedValue: uint64(1337),
+			path:          "NetworkConfig.L1Config.L1ChainID",
+			expectedValue: uint64(5),
 		},
 		{
-			path:          "Etherman.PrivateKeyPath",
-			expectedValue: "",
+			path:          "NetworkConfig.L1Config.ZkEVMAddr",
+			expectedValue: common.HexToAddress("0xa997cfD539E703921fD1e3Cf25b4c241a27a4c7A"),
 		},
 		{
-			path:          "Etherman.PrivateKeyPassword",
-			expectedValue: "",
+			path:          "NetworkConfig.L1Config.PolAddr",
+			expectedValue: common.HexToAddress("0x1319D23c2F7034F52Eb07399702B040bA278Ca49"),
 		},
 		{
-			path:          "Etherman.PoEAddr",
-			expectedValue: common.HexToAddress("0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6"),
-		},
-		{
-			path:          "Etherman.MaticAddr",
-			expectedValue: common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
-		},
-		{
-			path:          "Etherman.GlobalExitRootManagerAddr",
-			expectedValue: common.HexToAddress("0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"),
+			path:          "NetworkConfig.L1Config.GlobalExitRootManagerAddr",
+			expectedValue: common.HexToAddress("0x4d9427DCA0406358445bC0a8F88C26b704004f74"),
 		},
 		{
 			path:          "Etherman.MultiGasProvider",
-			expectedValue: true,
+			expectedValue: false,
 		},
 		{
-			path:          "EthTxManager.MaxSendBatchTxRetries",
-			expectedValue: uint32(10),
-		},
-		{
-			path:          "EthTxManager.MaxVerifyBatchTxRetries",
-			expectedValue: uint32(10),
-		},
-		{
-			path:          "EthTxManager.FrequencyForResendingFailedSendBatches",
-			expectedValue: types.NewDuration(1 * time.Second),
-		},
-		{
-			path:          "EthTxManager.FrequencyForResendingFailedVerifyBatch",
+			path:          "EthTxManager.FrequencyToMonitorTxs",
 			expectedValue: types.NewDuration(1 * time.Second),
 		},
 		{
@@ -185,87 +206,156 @@ func Test_Defaults(t *testing.T) {
 			expectedValue: types.NewDuration(2 * time.Minute),
 		},
 		{
-			path:          "EthTxManager.WaitTxToBeSynced",
-			expectedValue: types.NewDuration(10 * time.Second),
+			path:          "EthTxManager.WaitTxToBeMined",
+			expectedValue: types.NewDuration(2 * time.Minute),
 		},
 		{
-			path:          "EthTxManager.PercentageToIncreaseGasPrice",
-			expectedValue: uint64(10),
+			path:          "EthTxManager.ForcedGas",
+			expectedValue: uint64(0),
 		},
 		{
-			path:          "EthTxManager.PercentageToIncreaseGasLimit",
-			expectedValue: uint64(10),
+			path:          "EthTxManager.GasPriceMarginFactor",
+			expectedValue: float64(1),
 		},
 		{
-			path:          "PriceGetter.Type",
-			expectedValue: pricegetter.DefaultType,
+			path:          "EthTxManager.MaxGasPriceLimit",
+			expectedValue: uint64(0),
 		},
 		{
-			path:          "PriceGetter.DefaultPrice",
-			expectedValue: pricegetter.TokenPrice{Float: new(big.Float).SetInt64(2000)},
+			path:          "L2GasPriceSuggester.DefaultGasPriceWei",
+			expectedValue: uint64(2000000000),
 		},
 		{
-			path:          "GasPriceEstimator.DefaultGasPriceWei",
-			expectedValue: uint64(1000000000),
+			path:          "L2GasPriceSuggester.MaxGasPriceWei",
+			expectedValue: uint64(0),
 		},
 		{
 			path:          "MTClient.URI",
-			expectedValue: "127.0.0.1:50061",
+			expectedValue: "zkevm-prover:50061",
 		},
 		{
-			path:          "StateDB.User",
+			path:          "State.DB.User",
 			expectedValue: "state_user",
 		},
 		{
-			path:          "StateDB.Password",
+			path:          "State.DB.Password",
 			expectedValue: "state_password",
 		},
 		{
-			path:          "StateDB.Name",
+			path:          "State.DB.Name",
 			expectedValue: "state_db",
 		},
 		{
-			path:          "StateDB.Host",
-			expectedValue: "localhost",
+			path:          "State.DB.Host",
+			expectedValue: "zkevm-state-db",
 		},
 		{
-			path:          "StateDB.Port",
+			path:          "State.DB.Port",
 			expectedValue: "5432",
 		},
 		{
-			path:          "StateDB.EnableLog",
+			path:          "State.DB.EnableLog",
 			expectedValue: false,
 		},
 		{
-			path:          "StateDB.MaxConns",
+			path:          "State.DB.MaxConns",
 			expectedValue: 200,
 		},
 		{
-			path:          "PoolDB.User",
-			expectedValue: "pool_user",
+			path:          "Pool.IntervalToRefreshGasPrices",
+			expectedValue: types.NewDuration(5 * time.Second),
 		},
 		{
-			path:          "PoolDB.Password",
-			expectedValue: "pool_password",
+			path:          "Pool.MaxTxBytesSize",
+			expectedValue: uint64(100132),
 		},
 		{
-			path:          "PoolDB.Name",
-			expectedValue: "pool_db",
+			path:          "Pool.MaxTxDataBytesSize",
+			expectedValue: 100000,
+		},
+
+		{
+			path:          "Pool.DefaultMinGasPriceAllowed",
+			expectedValue: uint64(1000000000),
 		},
 		{
-			path:          "PoolDB.Host",
-			expectedValue: "localhost",
+			path:          "Pool.MinAllowedGasPriceInterval",
+			expectedValue: types.NewDuration(5 * time.Minute),
 		},
 		{
-			path:          "PoolDB.Port",
-			expectedValue: "5432",
+			path:          "Pool.PollMinAllowedGasPriceInterval",
+			expectedValue: types.NewDuration(15 * time.Second),
 		},
 		{
-			path:          "PoolDB.EnableLog",
+			path:          "Pool.AccountQueue",
+			expectedValue: uint64(64),
+		},
+		{
+			path:          "Pool.GlobalQueue",
+			expectedValue: uint64(1024),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.Enabled",
 			expectedValue: false,
 		},
 		{
-			path:          "PoolDB.MaxConns",
+			path:          "Pool.EffectiveGasPrice.L1GasPriceFactor",
+			expectedValue: float64(0.25),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.ByteGasCost",
+			expectedValue: uint64(16),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.ZeroByteGasCost",
+			expectedValue: uint64(4),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.NetProfit",
+			expectedValue: float64(1),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.BreakEvenFactor",
+			expectedValue: float64(1.1),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.FinalDeviationPct",
+			expectedValue: uint64(10),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.EthTransferGasPrice",
+			expectedValue: uint64(0),
+		},
+		{
+			path:          "Pool.EffectiveGasPrice.EthTransferL1GasPriceFactor",
+			expectedValue: float64(0),
+		},
+		{
+			path:          "Pool.DB.User",
+			expectedValue: "pool_user",
+		},
+		{
+			path:          "Pool.DB.Password",
+			expectedValue: "pool_password",
+		},
+		{
+			path:          "Pool.DB.Name",
+			expectedValue: "pool_db",
+		},
+		{
+			path:          "Pool.DB.Host",
+			expectedValue: "zkevm-pool-db",
+		},
+		{
+			path:          "Pool.DB.Port",
+			expectedValue: "5432",
+		},
+		{
+			path:          "Pool.DB.EnableLog",
+			expectedValue: false,
+		},
+		{
+			path:          "Pool.DB.MaxConns",
 			expectedValue: 200,
 		},
 		{
@@ -274,15 +364,15 @@ func Test_Defaults(t *testing.T) {
 		},
 		{
 			path:          "RPC.Port",
-			expectedValue: int(8123),
+			expectedValue: int(8545),
 		},
 		{
-			path:          "RPC.ReadTimeoutInSec",
-			expectedValue: time.Duration(60),
+			path:          "RPC.ReadTimeout",
+			expectedValue: types.NewDuration(60 * time.Second),
 		},
 		{
-			path:          "RPC.WriteTimeoutInSec",
-			expectedValue: time.Duration(60),
+			path:          "RPC.WriteTimeout",
+			expectedValue: types.NewDuration(60 * time.Second),
 		},
 		{
 			path:          "RPC.SequencerNodeURI",
@@ -290,35 +380,67 @@ func Test_Defaults(t *testing.T) {
 		},
 		{
 			path:          "RPC.MaxRequestsPerIPAndSecond",
-			expectedValue: float64(50),
+			expectedValue: float64(500),
 		},
 		{
-			path:          "RPC.BroadcastURI",
-			expectedValue: "127.0.0.1:61090",
+			path:          "RPC.EnableL2SuggestedGasPricePolling",
+			expectedValue: true,
 		},
 		{
-			path:          "RPC.DefaultSenderAddress",
-			expectedValue: "0x1111111111111111111111111111111111111111",
-		},
-		{
-			path:          "RPC.WebSockets.Enabled",
+			path:          "RPC.BatchRequestsEnabled",
 			expectedValue: false,
 		},
 		{
-			path:          "RPC.WebSockets.Port",
-			expectedValue: 8133,
+			path:          "RPC.BatchRequestsLimit",
+			expectedValue: uint(20),
 		},
 		{
-			path:          "Executor.URI",
-			expectedValue: "127.0.0.1:50071",
+			path:          "RPC.MaxLogsCount",
+			expectedValue: uint64(10000),
 		},
 		{
-			path:          "BroadcastServer.Host",
+			path:          "RPC.MaxLogsBlockRange",
+			expectedValue: uint64(10000),
+		},
+		{
+			path:          "RPC.MaxNativeBlockHashBlockRange",
+			expectedValue: uint64(60000),
+		},
+		{
+			path:          "RPC.EnableHttpLog",
+			expectedValue: true,
+		},
+		{
+			path:          "RPC.WebSockets.Enabled",
+			expectedValue: true,
+		},
+		{
+			path:          "RPC.WebSockets.Host",
 			expectedValue: "0.0.0.0",
 		},
 		{
-			path:          "BroadcastServer.Port",
-			expectedValue: 61090,
+			path:          "RPC.WebSockets.Port",
+			expectedValue: int(8546),
+		},
+		{
+			path:          "RPC.WebSockets.ReadLimit",
+			expectedValue: int64(104857600),
+		},
+		{
+			path:          "Executor.URI",
+			expectedValue: "zkevm-prover:50071",
+		},
+		{
+			path:          "Executor.MaxResourceExhaustedAttempts",
+			expectedValue: 3,
+		},
+		{
+			path:          "Executor.WaitOnResourceExhaustion",
+			expectedValue: types.NewDuration(1 * time.Second),
+		},
+		{
+			path:          "Executor.MaxGRPCMessageSize",
+			expectedValue: int(100000000),
 		},
 		{
 			path:          "Metrics.Host",
@@ -332,7 +454,90 @@ func Test_Defaults(t *testing.T) {
 			path:          "Metrics.Enabled",
 			expectedValue: false,
 		},
-		// TODO(pg): add Aggregator section
+		{
+			path:          "Aggregator.Host",
+			expectedValue: "0.0.0.0",
+		},
+		{
+			path:          "Aggregator.Port",
+			expectedValue: 50081,
+		},
+		{
+			path:          "Aggregator.RetryTime",
+			expectedValue: types.NewDuration(5 * time.Second),
+		},
+		{
+			path:          "Aggregator.VerifyProofInterval",
+			expectedValue: types.NewDuration(90 * time.Second),
+		},
+		{
+			path:          "Aggregator.TxProfitabilityCheckerType",
+			expectedValue: aggregator.TxProfitabilityCheckerType(aggregator.ProfitabilityAcceptAll),
+		},
+		{
+			path:          "Aggregator.TxProfitabilityMinReward",
+			expectedValue: aggregator.TokenAmountWithDecimals{Int: big.NewInt(1100000000000000000)},
+		},
+		{
+			path:          "Aggregator.ProofStatePollingInterval",
+			expectedValue: types.NewDuration(5 * time.Second),
+		},
+		{
+			path:          "Aggregator.CleanupLockedProofsInterval",
+			expectedValue: types.NewDuration(2 * time.Minute),
+		},
+		{
+			path:          "Aggregator.GeneratingProofCleanupThreshold",
+			expectedValue: "10m",
+		},
+		{
+			path:          "Aggregator.GasOffset",
+			expectedValue: uint64(0),
+		},
+		{
+			path:          "Aggregator.UpgradeEtrogBatchNumber",
+			expectedValue: uint64(0),
+		},
+		{
+			path:          "Aggregator.BatchProofL1BlockConfirmations",
+			expectedValue: uint64(2),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxTxsPerBatch",
+			expectedValue: uint64(300),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxBatchBytesSize",
+			expectedValue: uint64(120000),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxCumulativeGasUsed",
+			expectedValue: uint64(1125899906842624),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxKeccakHashes",
+			expectedValue: uint32(2145),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxPoseidonHashes",
+			expectedValue: uint32(252357),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxPoseidonPaddings",
+			expectedValue: uint32(135191),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxMemAligns",
+			expectedValue: uint32(236585),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxArithmetics",
+			expectedValue: uint32(236585),
+		},
+		{
+			path:          "State.Batch.Constraints.MaxBinaries",
+			expectedValue: uint32(473170),
+		},
 	}
 	file, err := os.CreateTemp("", "genesisConfig")
 	require.NoError(t, err)
@@ -342,9 +547,9 @@ func Test_Defaults(t *testing.T) {
 	require.NoError(t, os.WriteFile(file.Name(), []byte("{}"), 0600))
 
 	flagSet := flag.NewFlagSet("", flag.PanicOnError)
-	flagSet.String(config.FlagGenesisFile, file.Name(), "")
+	flagSet.String(config.FlagNetwork, "testnet", "")
 	ctx := cli.NewContext(cli.NewApp(), flagSet, nil)
-	cfg, err := config.Load(ctx)
+	cfg, err := config.Load(ctx, true)
 	if err != nil {
 		t.Fatalf("Unexpected error loading default config: %v", err)
 	}
@@ -370,4 +575,29 @@ func getValueFromStruct(path string, object interface{}) interface{} {
 		v = v.FieldByName(key)
 	}
 	return v.Interface()
+}
+
+func TestEnvVarArrayDecoding(t *testing.T) {
+	file, err := os.CreateTemp("", "genesisConfig")
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, os.Remove(file.Name()))
+	}()
+	require.NoError(t, os.WriteFile(file.Name(), []byte("{}"), 0600))
+	flagSet := flag.NewFlagSet("", flag.PanicOnError)
+	flagSet.String(config.FlagNetwork, "testnet", "")
+	ctx := cli.NewContext(cli.NewApp(), flagSet, nil)
+
+	os.Setenv("ZKEVM_NODE_LOG_OUTPUTS", "a,b,c")
+	defer func() {
+		os.Unsetenv("ZKEVM_NODE_LOG_OUTPUTS")
+	}()
+
+	cfg, err := config.Load(ctx, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, len(cfg.Log.Outputs))
+	assert.Equal(t, "a", cfg.Log.Outputs[0])
+	assert.Equal(t, "b", cfg.Log.Outputs[1])
+	assert.Equal(t, "c", cfg.Log.Outputs[2])
 }

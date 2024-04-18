@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/0xPolygonHermez/zkevm-node"
 	"github.com/hermeznetwork/tracerr"
@@ -27,11 +28,12 @@ type Logger struct {
 }
 
 // root logger
-var log *Logger
+var log atomic.Pointer[Logger]
 
 func getDefaultLog() *Logger {
-	if log != nil {
-		return log
+	l := log.Load()
+	if l != nil {
+		return l
 	}
 	// default level: debug
 	zapLogger, _, err := NewLogger(Config{
@@ -42,8 +44,8 @@ func getDefaultLog() *Logger {
 	if err != nil {
 		panic(err)
 	}
-	log = &Logger{x: zapLogger}
-	return log
+	log.Store(&Logger{x: zapLogger})
+	return log.Load()
 }
 
 // Init the logger with defined level. outputs defines the outputs where the
@@ -56,7 +58,7 @@ func Init(cfg Config) {
 	if err != nil {
 		panic(err)
 	}
-	log = &Logger{x: zapLogger}
+	log.Store(&Logger{x: zapLogger})
 }
 
 // NewLogger creates the logger with defined level. outputs defines the outputs where the
@@ -266,53 +268,53 @@ func appendStackTraceMaybeKV(msg string, kv []interface{}) string {
 }
 
 // Debugw calls log.Debugw
-func (l *Logger) Debugw(template string, kv ...interface{}) {
-	l.x.Debugw(template, kv...)
+func (l *Logger) Debugw(msg string, kv ...interface{}) {
+	l.x.Debugw(msg, kv...)
 }
 
 // Infow calls log.Infow
-func (l *Logger) Infow(template string, kv ...interface{}) {
-	l.x.Infow(template, kv...)
+func (l *Logger) Infow(msg string, kv ...interface{}) {
+	l.x.Infow(msg, kv...)
 }
 
 // Warnw calls log.Warnw
-func (l *Logger) Warnw(template string, kv ...interface{}) {
-	l.x.Warnw(template, kv...)
+func (l *Logger) Warnw(msg string, kv ...interface{}) {
+	l.x.Warnw(msg, kv...)
 }
 
 // Errorw calls log.Errorw
-func (l *Logger) Errorw(template string, kv ...interface{}) {
-	l.x.Errorw(template, kv...)
+func (l *Logger) Errorw(msg string, kv ...interface{}) {
+	l.x.Errorw(msg, kv...)
 }
 
 // Fatalw calls log.Fatalw
-func (l *Logger) Fatalw(template string, kv ...interface{}) {
-	l.x.Fatalw(template, kv...)
+func (l *Logger) Fatalw(msg string, kv ...interface{}) {
+	l.x.Fatalw(msg, kv...)
 }
 
 // Debugw calls log.Debugw on the root Logger.
-func Debugw(template string, kv ...interface{}) {
-	getDefaultLog().Debugw(template, kv...)
+func Debugw(msg string, kv ...interface{}) {
+	getDefaultLog().Debugw(msg, kv...)
 }
 
 // Infow calls log.Infow on the root Logger.
-func Infow(template string, kv ...interface{}) {
-	getDefaultLog().Infow(template, kv...)
+func Infow(msg string, kv ...interface{}) {
+	getDefaultLog().Infow(msg, kv...)
 }
 
 // Warnw calls log.Warnw on the root Logger.
-func Warnw(template string, kv ...interface{}) {
-	getDefaultLog().Warnw(template, kv...)
+func Warnw(msg string, kv ...interface{}) {
+	getDefaultLog().Warnw(msg, kv...)
 }
 
 // Errorw calls log.Errorw on the root Logger.
-func Errorw(template string, kv ...interface{}) {
-	template = appendStackTraceMaybeKV(template, kv)
-	getDefaultLog().Errorw(template, kv...)
+func Errorw(msg string, kv ...interface{}) {
+	msg = appendStackTraceMaybeKV(msg, kv)
+	getDefaultLog().Errorw(msg, kv...)
 }
 
 // Fatalw calls log.Fatalw on the root Logger.
-func Fatalw(template string, kv ...interface{}) {
-	template = appendStackTraceMaybeKV(template, kv)
-	getDefaultLog().Fatalw(template, kv...)
+func Fatalw(msg string, kv ...interface{}) {
+	msg = appendStackTraceMaybeKV(msg, kv)
+	getDefaultLog().Fatalw(msg, kv...)
 }

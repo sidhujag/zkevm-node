@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 
@@ -27,8 +27,10 @@ type gasPriceEtherscan struct {
 
 // Config structure
 type Config struct {
+	// Need API key to use etherscan, if it's empty etherscan is not used
 	ApiKey string `mapstructure:"ApiKey"`
-	Url    string
+	// URL of the etherscan API. Overwritten with a hardcoded URL: "https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey="
+	Url string
 }
 
 // Client for etherscan
@@ -58,7 +60,7 @@ func (e *Client) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 		return big.NewInt(0), err
 	}
 	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return big.NewInt(0), err
 	}

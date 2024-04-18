@@ -3,13 +3,13 @@ package jsonrpc
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
-	"sync"
 	"unicode"
 
+	"github.com/0xPolygonHermez/zkevm-node/jsonrpc/types"
 	"github.com/0xPolygonHermez/zkevm-node/log"
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -33,8 +33,9 @@ func (f *funcData) numParams() int {
 }
 
 type handleRequest struct {
-	Request
-	wsConn *websocket.Conn
+	types.Request
+	wsConn      *concurrentWsConn
+	HttpRequest *http.Request
 }
 
 // Handler manage services to handle jsonrpc requests
@@ -70,28 +71,15 @@ func newJSONRpcHandler() *Handler {
 	return handler
 }
 
-var connectionCounter = 0
-var connectionCounterMutex sync.Mutex
-
 // Handle is the function that knows which and how a function should
 // be executed when a JSON RPC request is received
-func (h *Handler) Handle(req handleRequest) Response {
+func (h *Handler) Handle(req handleRequest) types.Response {
 	log := log.WithFields("method", req.Method, "requestId", req.ID)
-	connectionCounterMutex.Lock()
-	connectionCounter++
-	connectionCounterMutex.Unlock()
-	defer func() {
-		connectionCounterMutex.Lock()
-		connectionCounter--
-		connectionCounterMutex.Unlock()
-		log.Debugf("Current open connections %d", connectionCounter)
-	}()
-	log.Debugf("Current open connections %d", connectionCounter)
 	log.Debugf("request params %v", string(req.Params))
 
 	service, fd, err := h.getFnHandler(req.Request)
 	if err != nil {
-		return NewResponse(req.Request, nil, err)
+		return types.NewResponse(req.Request, nil, err)
 	}
 
 	inArgsOffset := 0
@@ -101,18 +89,25 @@ func (h *Handler) Handle(req handleRequest) Response {
 	requestHasWebSocketConn := req.wsConn != nil
 	funcHasMoreThanOneInputParams := len(fd.reqt) > 1
 	firstFuncParamIsWebSocketConn := false
+	firstFuncParamIsHttpRequest := false
 	if funcHasMoreThanOneInputParams {
-		firstFuncParamIsWebSocketConn = fd.reqt[1].AssignableTo(reflect.TypeOf(&websocket.Conn{}))
+		firstFuncParamIsWebSocketConn = fd.reqt[1].AssignableTo(reflect.TypeOf(&concurrentWsConn{}))
+		firstFuncParamIsHttpRequest = fd.reqt[1].AssignableTo(reflect.TypeOf(&http.Request{}))
 	}
 	if requestHasWebSocketConn && firstFuncParamIsWebSocketConn {
 		inArgs[1] = reflect.ValueOf(req.wsConn)
+		inArgsOffset++
+	} else if firstFuncParamIsHttpRequest {
+		// If in the future one endponit needs to have both a websocket connection and an http request
+		// we will need to modify this code to properly handle it
+		inArgs[1] = reflect.ValueOf(req.HttpRequest)
 		inArgsOffset++
 	}
 
 	// check params passed by request match function params
 	var testStruct []interface{}
 	if err := json.Unmarshal(req.Params, &testStruct); err == nil && len(testStruct) > fd.numParams() {
-		return NewResponse(req.Request, nil, newRPCError(invalidParamsErrorCode, fmt.Sprintf("too many arguments, want at most %d", fd.numParams())))
+		return types.NewResponse(req.Request, nil, types.NewRPCError(types.InvalidParamsErrorCode, fmt.Sprintf("too many arguments, want at most %d", fd.numParams())))
 	}
 
 	inputs := make([]interface{}, fd.numParams()-inArgsOffset)
@@ -125,14 +120,14 @@ func (h *Handler) Handle(req handleRequest) Response {
 
 	if fd.numParams() > 0 {
 		if err := json.Unmarshal(req.Params, &inputs); err != nil {
-			return NewResponse(req.Request, nil, newRPCError(invalidParamsErrorCode, "Invalid Params"))
+			return types.NewResponse(req.Request, nil, types.NewRPCError(types.InvalidParamsErrorCode, "Invalid Params"))
 		}
 	}
 
 	output := fd.fv.Call(inArgs)
 	if err := getError(output[1]); err != nil {
-		log.Infof("failed call: [%v]%v. Params: %v", err.ErrorCode(), err.Error(), string(req.Params))
-		return NewResponse(req.Request, nil, err)
+		log.Debugf("failed call: [%v]%v. Params: %v", err.ErrorCode(), err.Error(), string(req.Params))
+		return types.NewResponse(req.Request, nil, err)
 	}
 
 	var data []byte
@@ -142,26 +137,28 @@ func (h *Handler) Handle(req handleRequest) Response {
 		data = d
 	}
 
-	return NewResponse(req.Request, data, nil)
+	return types.NewResponse(req.Request, data, nil)
 }
 
 // HandleWs handle websocket requests
-func (h *Handler) HandleWs(reqBody []byte, wsConn *websocket.Conn) ([]byte, error) {
-	var req Request
+func (h *Handler) HandleWs(reqBody []byte, wsConn *concurrentWsConn, httpReq *http.Request) ([]byte, error) {
+	log.Debugf("WS message received: %v", string(reqBody))
+	var req types.Request
 	if err := json.Unmarshal(reqBody, &req); err != nil {
-		return NewResponse(req, nil, newRPCError(invalidRequestErrorCode, "Invalid json request")).Bytes()
+		return types.NewResponse(req, nil, types.NewRPCError(types.InvalidRequestErrorCode, "Invalid json request")).Bytes()
 	}
 
 	handleReq := handleRequest{
-		Request: req,
-		wsConn:  wsConn,
+		Request:     req,
+		wsConn:      wsConn,
+		HttpRequest: httpReq,
 	}
 
 	return h.Handle(handleReq).Bytes()
 }
 
 // RemoveFilterByWsConn uninstalls the filter attached to this websocket connection
-func (h *Handler) RemoveFilterByWsConn(wsConn *websocket.Conn) {
+func (h *Handler) RemoveFilterByWsConn(wsConn *concurrentWsConn) {
 	service, ok := h.serviceMap[APIEth]
 	if !ok {
 		return
@@ -172,7 +169,7 @@ func (h *Handler) RemoveFilterByWsConn(wsConn *websocket.Conn) {
 		log.Errorf("failed to get ETH endpoint interface")
 	}
 
-	ethEndpoints := ethEndpointsInterface.(*Eth)
+	ethEndpoints := ethEndpointsInterface.(*EthEndpoints)
 	if ethEndpoints == nil {
 		log.Errorf("failed to get ETH endpoint instance")
 		return
@@ -185,10 +182,10 @@ func (h *Handler) RemoveFilterByWsConn(wsConn *websocket.Conn) {
 	}
 }
 
-func (h *Handler) registerService(serviceName string, service interface{}) {
-	st := reflect.TypeOf(service)
+func (h *Handler) registerService(service Service) {
+	st := reflect.TypeOf(service.Service)
 	if st.Kind() == reflect.Struct {
-		panic(fmt.Sprintf("jsonrpc: service '%s' must be a pointer to struct", serviceName))
+		panic(fmt.Sprintf("jsonrpc: service '%s' must be a pointer to struct", service.Name))
 	}
 
 	funcMap := make(map[string]*funcData)
@@ -200,7 +197,7 @@ func (h *Handler) registerService(serviceName string, service interface{}) {
 		}
 
 		name := lowerCaseFirst(mv.Name)
-		funcName := serviceName + "_" + name
+		funcName := service.Name + "_" + name
 		fd := &funcData{
 			fv: mv.Func,
 		}
@@ -218,37 +215,35 @@ func (h *Handler) registerService(serviceName string, service interface{}) {
 		funcMap[name] = fd
 	}
 
-	h.serviceMap[serviceName] = &serviceData{
-		sv:      reflect.ValueOf(service),
+	h.serviceMap[service.Name] = &serviceData{
+		sv:      reflect.ValueOf(service.Service),
 		funcMap: funcMap,
 	}
 }
 
-func (h *Handler) getFnHandler(req Request) (*serviceData, *funcData, rpcError) {
+func (h *Handler) getFnHandler(req types.Request) (*serviceData, *funcData, types.Error) {
 	methodNotFoundErrorMessage := fmt.Sprintf("the method %s does not exist/is not available", req.Method)
 
-	callName := strings.SplitN(req.Method, "_", 2) //nolint:gomnd
-	if len(callName) != 2 {                        //nolint:gomnd
-		return nil, nil, newRPCError(notFoundErrorCode, methodNotFoundErrorMessage)
+	serviceName, funcName, found := strings.Cut(req.Method, "_")
+	if !found {
+		return nil, nil, types.NewRPCError(types.NotFoundErrorCode, methodNotFoundErrorMessage)
 	}
-
-	serviceName, funcName := callName[0], callName[1]
 
 	service, ok := h.serviceMap[serviceName]
 	if !ok {
-		log.Infof("Method %s not found", req.Method)
-		return nil, nil, newRPCError(notFoundErrorCode, methodNotFoundErrorMessage)
+		log.Debugf("Method %s not found", req.Method)
+		return nil, nil, types.NewRPCError(types.NotFoundErrorCode, methodNotFoundErrorMessage)
 	}
 	fd, ok := service.funcMap[funcName]
 	if !ok {
-		return nil, nil, newRPCError(notFoundErrorCode, methodNotFoundErrorMessage)
+		return nil, nil, types.NewRPCError(types.NotFoundErrorCode, methodNotFoundErrorMessage)
 	}
 	return service, fd, nil
 }
 
 func validateFunc(funcName string, fv reflect.Value, isMethod bool) (inNum int, reqt []reflect.Type, err error) {
 	if funcName == "" {
-		err = fmt.Errorf("funcName cannot be empty")
+		err = fmt.Errorf("getBlockNumByArg cannot be empty")
 		return
 	}
 
@@ -277,22 +272,22 @@ func validateFunc(funcName string, fv reflect.Value, isMethod bool) (inNum int, 
 	return
 }
 
-var rpcErrType = reflect.TypeOf((*rpcError)(nil)).Elem()
+var rpcErrType = reflect.TypeOf((*types.Error)(nil)).Elem()
 
 func isRPCErrorType(t reflect.Type) bool {
 	return t.Implements(rpcErrType)
 }
 
-func getError(v reflect.Value) rpcError {
+func getError(v reflect.Value) types.Error {
 	if v.IsNil() {
 		return nil
 	}
 
 	switch vt := v.Interface().(type) {
-	case *RPCError:
+	case *types.RPCError:
 		return vt
 	default:
-		return newRPCError(defaultErrorCode, "runtime error")
+		return types.NewRPCError(types.DefaultErrorCode, "runtime error")
 	}
 }
 

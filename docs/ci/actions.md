@@ -23,7 +23,6 @@ PR opened and pushing changes to PRs.
 
 Pushes docker images to docker hub, the images pushed are:
 * `hermeznetwork/zkevm-node:develop`
-* `hermeznetwork/zkprover-mock:develop`
 
 ### When is executed
 
@@ -33,7 +32,6 @@ Changes pushed to the `develop` branch.
 
 Pushes docker images to docker hub, the images pushed are:
 * `hermeznetwork/zkevm-node:latest`
-* `hermeznetwork/zkprover-mock:latest`
 
 ### When is executed
 
@@ -86,7 +84,7 @@ so that we can review and eventually approve the changes to be included in the
 
 ### When is executed
 
-It runs as an scheduled action, every 3 hours.
+It runs as a scheduled action, every 3 hours.
 
 [golang linter]: https://golangci-lint.run/
 [linter configuration file]: ../../.golangci.yml

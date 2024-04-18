@@ -4,20 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
 	"time"
 
-	"github.com/0xPolygonHermez/zkevm-node/jsonrpc"
+	"github.com/0xPolygonHermez/zkevm-node/hex"
+	"github.com/0xPolygonHermez/zkevm-node/jsonrpc/client"
 	"github.com/0xPolygonHermez/zkevm-node/log"
+	"github.com/0xPolygonHermez/zkevm-node/state"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -27,7 +32,7 @@ const (
 	// DefaultInterval is a time interval
 	DefaultInterval = 2 * time.Millisecond
 	// DefaultDeadline is a time interval
-	DefaultDeadline = 30 * time.Second
+	DefaultDeadline = 2 * time.Minute
 	// DefaultTxMinedDeadline is a time interval
 	DefaultTxMinedDeadline = 5 * time.Second
 )
@@ -79,13 +84,15 @@ func WaitTxToBeMined(parentCtx context.Context, client ethClienter, tx *types.Tr
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 	receipt, err := bind.WaitMined(ctx, client, tx)
-	if err != nil {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return err
+	} else if err != nil {
 		log.Errorf("error waiting tx %s to be mined: %w", tx.Hash(), err)
 		return err
 	}
 	if receipt.Status == types.ReceiptStatusFailed {
 		// Get revert reason
-		reason, reasonErr := revertReason(ctx, client, tx, receipt.BlockNumber)
+		reason, reasonErr := RevertReason(ctx, client, tx, receipt.BlockNumber)
 		if reasonErr != nil {
 			reason = reasonErr.Error()
 		}
@@ -95,7 +102,12 @@ func WaitTxToBeMined(parentCtx context.Context, client ethClienter, tx *types.Tr
 	return nil
 }
 
-func revertReason(ctx context.Context, c ethClienter, tx *types.Transaction, blockNumber *big.Int) (string, error) {
+// RevertReason returns the revert reason for a tx that has a receipt with failed status
+func RevertReason(ctx context.Context, c ethClienter, tx *types.Transaction, blockNumber *big.Int) (string, error) {
+	if tx == nil {
+		return "", nil
+	}
+
 	from, err := types.Sender(types.NewEIP155Signer(tx.ChainId()), tx)
 	if err != nil {
 		signer := types.LatestSignerForChainID(tx.ChainId())
@@ -117,7 +129,13 @@ func revertReason(ctx context.Context, c ethClienter, tx *types.Transaction, blo
 		return "", err
 	}
 
-	return abi.UnpackRevert(hex)
+	unpackedMsg, err := abi.UnpackRevert(hex)
+	if err != nil {
+		log.Warnf("failed to get the revert message for tx %v: %v", tx.Hash(), err)
+		return "", errors.New("execution reverted")
+	}
+
+	return unpackedMsg, nil
 }
 
 // WaitGRPCHealthy waits for a gRPC endpoint to be responding according to the
@@ -137,9 +155,57 @@ func WaitL2BlockToBeConsolidated(l2Block *big.Int, timeout time.Duration) error 
 
 // WaitL2BlockToBeVirtualized waits until a L2 Block has been virtualized or the given timeout expires.
 func WaitL2BlockToBeVirtualized(l2Block *big.Int, timeout time.Duration) error {
+	l2NetworkURL := "http://localhost:8123"
 	return Poll(DefaultInterval, timeout, func() (bool, error) {
-		return l2BlockVirtualizationCondition(l2Block)
+		return l2BlockVirtualizationCondition(l2Block, l2NetworkURL)
 	})
+}
+
+// WaitL2BlockToBeVirtualizedCustomRPC waits until a L2 Block has been virtualized or the given timeout expires.
+func WaitL2BlockToBeVirtualizedCustomRPC(l2Block *big.Int, timeout time.Duration, l2NetworkURL string) error {
+	return Poll(DefaultInterval, timeout, func() (bool, error) {
+		return l2BlockVirtualizationCondition(l2Block, l2NetworkURL)
+	})
+}
+
+// WaitBatchToBeVirtualized waits until a Batch has been virtualized or the given timeout expires.
+func WaitBatchToBeVirtualized(batchNum uint64, timeout time.Duration, state *state.State) error {
+	ctx := context.Background()
+	return Poll(DefaultInterval, timeout, func() (bool, error) {
+		return state.IsBatchVirtualized(ctx, batchNum, nil)
+	})
+}
+
+// WaitBatchToBeConsolidated waits until a Batch has been consolidated/verified or the given timeout expires.
+func WaitBatchToBeConsolidated(batchNum uint64, timeout time.Duration, state *state.State) error {
+	ctx := context.Background()
+	return Poll(DefaultInterval, timeout, func() (bool, error) {
+		return state.IsBatchConsolidated(ctx, batchNum, nil)
+	})
+}
+
+func WaitTxReceipt(ctx context.Context, txHash common.Hash, timeout time.Duration, client *ethclient.Client) (*types.Receipt, error) {
+	if client == nil {
+		return nil, fmt.Errorf("client is nil")
+	}
+	var receipt *types.Receipt
+	pollErr := Poll(DefaultInterval, timeout, func() (bool, error) {
+		var err error
+		receipt, err = client.TransactionReceipt(ctx, txHash)
+		if err != nil {
+			if errors.Is(err, ethereum.NotFound) {
+				time.Sleep(time.Second)
+				return false, nil
+			} else {
+				return false, err
+			}
+		}
+		return true, nil
+	})
+	if pollErr != nil {
+		return nil, pollErr
+	}
+	return receipt, nil
 }
 
 // NodeUpCondition check if the container is up and running
@@ -167,7 +233,7 @@ func NodeUpCondition(target string) (bool, error) {
 		}()
 	}
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 
 	if err != nil {
 		return false, err
@@ -175,7 +241,9 @@ func NodeUpCondition(target string) (bool, error) {
 
 	r := struct {
 		Result bool
-	}{}
+	}{
+		Result: true,
+	}
 	err = json.Unmarshal(body, &r)
 	if err != nil {
 		return false, err
@@ -227,7 +295,7 @@ func grpcHealthyCondition(address string) (bool, error) {
 // l2BlockConsolidationCondition
 func l2BlockConsolidationCondition(l2Block *big.Int) (bool, error) {
 	l2NetworkURL := "http://localhost:8123"
-	response, err := jsonrpc.JSONRPCCall(l2NetworkURL, "zkevm_isL2BlockConsolidated", l2Block.Uint64())
+	response, err := client.JSONRPCCall(l2NetworkURL, "zkevm_isBlockConsolidated", hex.EncodeBig(l2Block))
 	if err != nil {
 		return false, err
 	}
@@ -243,9 +311,8 @@ func l2BlockConsolidationCondition(l2Block *big.Int) (bool, error) {
 }
 
 // l2BlockVirtualizationCondition
-func l2BlockVirtualizationCondition(l2Block *big.Int) (bool, error) {
-	l2NetworkURL := "http://localhost:8123"
-	response, err := jsonrpc.JSONRPCCall(l2NetworkURL, "zkevm_isL2BlockVirtualized", l2Block.Uint64())
+func l2BlockVirtualizationCondition(l2Block *big.Int, l2NetworkURL string) (bool, error) {
+	response, err := client.JSONRPCCall(l2NetworkURL, "zkevm_isBlockVirtualized", hex.EncodeBig(l2Block))
 	if err != nil {
 		return false, err
 	}

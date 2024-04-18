@@ -6,25 +6,38 @@ import (
 	"strings"
 
 	"github.com/0xPolygonHermez/zkevm-node/config"
+	"github.com/0xPolygonHermez/zkevm-node/encoding"
 	"github.com/0xPolygonHermez/zkevm-node/log"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/urfave/cli/v2"
 )
 
 func approveTokens(ctx *cli.Context) error {
-	a := ctx.String(config.FlagAmount)
-	amount, _ := new(big.Float).SetString(a)
-	if amount == nil {
-		fmt.Println("Please, introduce a valid amount. Use '.' instead of ',' if it is a decimal number")
-		return nil
+	const bitSize uint = 256
+	useMaxAmountArg := ctx.Bool(config.FlagMaxAmount)
+	var amount *big.Int
+	if !useMaxAmountArg {
+		amountArg := ctx.String(config.FlagAmount)
+		amount, _ = new(big.Int).SetString(amountArg, encoding.Base10)
+		if amount == nil {
+			fmt.Println("Please, introduce a valid amount in wei")
+			return nil
+		}
+	} else {
+		amount = new(big.Int).Sub(new(big.Int).Lsh(common.Big1, bitSize), common.Big1)
 	}
-	c, err := config.Load(ctx)
+
+	addrKeyStorePath := ctx.String(config.FlagKeyStorePath)
+	addrPassword := ctx.String(config.FlagPassword)
+
+	c, err := config.Load(ctx, true)
 	if err != nil {
 		return err
 	}
 
 	if !ctx.Bool(config.FlagYes) {
-		fmt.Print("*WARNING* Are you sure you want to approve ", amount,
-			" tokens to be spent by the smc <Name: PoE. Address: "+c.Etherman.PoEAddr.String()+">? [y/N]: ")
+		fmt.Print("*WARNING* Are you sure you want to approve ", amount.String(),
+			" tokens (in wei) for the smc <Name: PoE. Address: "+c.NetworkConfig.L1Config.ZkEVMAddr.String()+">? [y/N]: ")
 		var input string
 		if _, err := fmt.Scanln(&input); err != nil {
 			return err
@@ -44,11 +57,14 @@ func approveTokens(ctx *cli.Context) error {
 		return err
 	}
 
-	const decimals = 1000000000000000000
-	amountInWei := new(big.Float).Mul(amount, big.NewFloat(decimals))
-	amountB := new(big.Int)
-	amountInWei.Int(amountB)
-	tx, err := etherman.ApproveMatic(ctx.Context, amountB, c.Etherman.PoEAddr)
+	// load auth from keystore file
+	auth, err := etherman.LoadAuthFromKeyStore(addrKeyStorePath, addrPassword)
+	if err != nil {
+		log.Fatal(err)
+		return err
+	}
+
+	tx, err := etherman.ApprovePol(ctx.Context, auth.From, amount, c.NetworkConfig.L1Config.ZkEVMAddr)
 	if err != nil {
 		return err
 	}
@@ -58,7 +74,7 @@ func approveTokens(ctx *cli.Context) error {
 		goerli  = 5
 		local   = 1337
 	)
-	switch c.Etherman.L1ChainID {
+	switch c.NetworkConfig.L1Config.L1ChainID {
 	case mainnet:
 		fmt.Println("Check tx status: https://etherscan.io/tx/" + tx.Hash().String())
 	case rinkeby:

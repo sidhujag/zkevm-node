@@ -4,7 +4,6 @@ import (
 	"reflect"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 )
 
 // Sequence represents an operation sent to the PoE smart contract to be
@@ -12,9 +11,12 @@ import (
 type Sequence struct {
 	GlobalExitRoot, StateRoot, LocalExitRoot common.Hash
 	AccInputHash                             common.Hash
-	Timestamp                                int64
-	Txs                                      []types.Transaction
+	LastL2BLockTimestamp                     int64
+	BatchL2Data                              []byte
 	IsSequenceTooBig                         bool
+	BatchNumber                              uint64
+	ForcedBatchTimestamp                     int64
+	PrevBlockHash                            common.Hash
 }
 
 // IsEmpty checks is sequence struct is empty

@@ -17,7 +17,7 @@ This documentation will help you running the following components:
 
 ## Requirements
 
-The current version of the environment requires `go`, `docker` and `docker-compose` to be previously installed, check the links bellow to understand how to install them:
+The current version of the environment requires `go`, `docker` and `docker-compose` to be previously installed, check the links below to understand how to install them:
 
 - <https://go.dev/doc/install>
 - <https://www.docker.com/get-started>
@@ -78,16 +78,16 @@ If you need sample data already deployed to the network, we have the following s
 make deploy-sc
 ```
 
-**To deploy a full a uniswap environment:**
+**To deploy a full uniswap environment:**
 
 ```bash
 make deploy-uniswap
 ```
 
-**To grant the Matic smart contract a set amount of tokens, run:**
+**To grant the Pol smart contract a set amount of tokens, run:**
 
 ```bash
-make run-approve-matic
+make run-approve-pol
 ```
 
 ## Accessing the environment
@@ -154,7 +154,7 @@ make run-approve-matic
     - `Type:` Web
     - `Host:` localhost
     - `Port:` 4001
-    - `Url:` <http://localhost:4000>
+    - `Url:` <http://localhost:4001>
 - Prover
   - `Type:` Mock
   - `Host:` localhost
@@ -191,10 +191,11 @@ To configure your Metamask to use your local environment, follow these steps:
 
 | Address | Description |
 |---|---|
-| 0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9 | Proof of Efficiency |
-| 0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9 | Bridge |
-| 0x5FbDB2315678afecb367f032d93F642f64180aa3 | Matic token |
-| 0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0 | GlobalExitRootManager |
+| 0x8dAF17A20c9DBA35f005b6324F493785D239719d | Polygon ZKEVM |
+| 0x40E0576c0A7dff9dc460B29ba73e79aBf73dD2a9 | Polygon Bridge |
+| 0x5FbDB2315678afecb367f032d93F642f64180aa3 | Pol token |
+| 0x8A791620dd6260079BF849Dc5567aDC3F2FdC318 | Polygon GlobalExitRootManager |
+| 0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e | Polygon RollupManager |
 
 ## Deployer Account
 

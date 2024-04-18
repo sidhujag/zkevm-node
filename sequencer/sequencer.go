@@ -2,262 +2,391 @@ package sequencer
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"sync"
 	"time"
 
-	"github.com/0xPolygonHermez/zkevm-node/etherman/types"
+	"github.com/0xPolygonHermez/zkevm-data-streamer/datastreamer"
+	"github.com/0xPolygonHermez/zkevm-node/event"
 	"github.com/0xPolygonHermez/zkevm-node/log"
-	"github.com/0xPolygonHermez/zkevm-node/sequencer/metrics"
-	"github.com/0xPolygonHermez/zkevm-node/sequencer/profitabilitychecker"
+	"github.com/0xPolygonHermez/zkevm-node/pool"
 	"github.com/0xPolygonHermez/zkevm-node/state"
 	"github.com/ethereum/go-ethereum/common"
-	ethTypes "github.com/ethereum/go-ethereum/core/types"
+)
+
+const (
+	datastreamChannelMultiplier = 2
 )
 
 // Sequencer represents a sequencer
 type Sequencer struct {
-	cfg Config
+	cfg      Config
+	batchCfg state.BatchConfig
+	poolCfg  pool.Config
 
 	pool      txPool
-	state     stateInterface
-	txManager txManager
-	etherman  etherman
-	checker   *profitabilitychecker.Checker
-	gpe       gasPriceEstimator
+	stateIntf stateInterface
+	eventLog  *event.EventLog
+	etherman  ethermanInterface
+	worker    *Worker
+	finalizer *finalizer
+
+	workerReadyTxsCond *timeoutCond
+
+	streamServer *datastreamer.StreamServer
+	dataToStream chan interface{}
 
 	address common.Address
 
-	sequenceInProgress types.Sequence
+	numberOfStateInconsistencies uint64
 }
 
 // New init sequencer
-func New(
-	cfg Config,
-	txPool txPool,
-	state stateInterface,
-	etherman etherman,
-	priceGetter priceGetter,
-	manager txManager,
-	gpe gasPriceEstimator) (*Sequencer, error) {
-	checker := profitabilitychecker.New(cfg.ProfitabilityChecker, etherman, priceGetter)
-
+func New(cfg Config, batchCfg state.BatchConfig, poolCfg pool.Config, txPool txPool, stateIntf stateInterface, etherman ethermanInterface, eventLog *event.EventLog) (*Sequencer, error) {
 	addr, err := etherman.TrustedSequencer()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get trusted sequencer address, err: %v", err)
+		return nil, fmt.Errorf("failed to get trusted sequencer address, error: %v", err)
 	}
-	// TODO: check that private key used in etherman matches addr
 
-	return &Sequencer{
+	sequencer := &Sequencer{
 		cfg:       cfg,
+		batchCfg:  batchCfg,
+		poolCfg:   poolCfg,
 		pool:      txPool,
-		state:     state,
+		stateIntf: stateIntf,
 		etherman:  etherman,
-		checker:   checker,
-		txManager: manager,
-		gpe:       gpe,
 		address:   addr,
-	}, nil
+		eventLog:  eventLog,
+	}
+
+	// TODO: Make configurable
+	channelBufferSize := 200 * datastreamChannelMultiplier // nolint:gomnd
+	sequencer.dataToStream = make(chan interface{}, channelBufferSize)
+
+	return sequencer, nil
 }
 
 // Start starts the sequencer
 func (s *Sequencer) Start(ctx context.Context) {
 	for !s.isSynced(ctx) {
 		log.Infof("waiting for synchronizer to sync...")
-		time.Sleep(s.cfg.WaitPeriodPoolIsEmpty.Duration)
+		time.Sleep(time.Second)
 	}
 
-	metrics.Register()
-	// initialize sequence
-	batchNum, err := s.state.GetLastBatchNumber(ctx, nil)
-	for err != nil {
-		if errors.Is(err, state.ErrStateNotSynchronized) {
-			log.Warnf("state is not synchronized, trying to get last batch num once again...")
-			time.Sleep(s.cfg.WaitPeriodPoolIsEmpty.Duration)
-			batchNum, err = s.state.GetLastBatchNumber(ctx, nil)
-		} else {
-			log.Fatalf("failed to get last batch number, err: %v", err)
-		}
+	err := s.pool.MarkWIPTxsAsPending(ctx)
+	if err != nil {
+		log.Fatalf("failed to mark WIP txs as pending, error: %v", err)
 	}
-	// case A: genesis
-	if batchNum == 0 {
-		s.createFirstBatch(ctx)
-	} else {
-		err = s.loadSequenceFromState(ctx)
+
+	// Start stream server if enabled
+	if s.cfg.StreamServer.Enabled {
+		s.streamServer, err = datastreamer.NewServer(s.cfg.StreamServer.Port, s.cfg.StreamServer.Version, s.cfg.StreamServer.ChainID, state.StreamTypeSequencer, s.cfg.StreamServer.Filename, &s.cfg.StreamServer.Log)
 		if err != nil {
-			log.Fatalf("failed to load sequence from the state, err: %v", err)
+			log.Fatalf("failed to create stream server, error: %v", err)
 		}
+
+		err = s.streamServer.Start()
+		if err != nil {
+			log.Fatalf("failed to start stream server, error: %v", err)
+		}
+
+		s.updateDataStreamerFile(ctx, s.cfg.StreamServer.ChainID)
 	}
 
-	go s.trackOldTxs(ctx)
-	tickerProcessTxs := time.NewTicker(s.cfg.WaitPeriodPoolIsEmpty.Duration)
-	tickerSendSequence := time.NewTicker(s.cfg.WaitPeriodSendSequence.Duration)
-	defer tickerProcessTxs.Stop()
-	defer tickerSendSequence.Stop()
-	go func() {
-		for {
-			s.tryToProcessTx(ctx, tickerProcessTxs)
-		}
-	}()
-	go func() {
-		for {
-			s.tryToSendSequence(ctx, tickerSendSequence)
-		}
-	}()
+	go s.loadFromPool(ctx)
+
+	if s.streamServer != nil {
+		go s.sendDataToStreamer(s.cfg.StreamServer.ChainID)
+	}
+
+	s.workerReadyTxsCond = newTimeoutCond(&sync.Mutex{})
+	s.worker = NewWorker(s.stateIntf, s.batchCfg.Constraints, s.workerReadyTxsCond)
+	s.finalizer = newFinalizer(s.cfg.Finalizer, s.poolCfg, s.worker, s.pool, s.stateIntf, s.etherman, s.address, s.isSynced, s.batchCfg.Constraints, s.eventLog, s.streamServer, s.workerReadyTxsCond, s.dataToStream)
+	go s.finalizer.Start(ctx)
+
+	go s.deleteOldPoolTxs(ctx)
+
+	go s.expireOldWorkerTxs(ctx)
+
+	go s.checkStateInconsistency(ctx)
+
 	// Wait until context is done
 	<-ctx.Done()
 }
 
-func (s *Sequencer) trackOldTxs(ctx context.Context) {
-	ticker := time.NewTicker(s.cfg.FrequencyToCheckTxsForDelete.Duration)
+// checkStateInconsistency checks if state inconsistency happened
+func (s *Sequencer) checkStateInconsistency(ctx context.Context) {
+	var err error
+	s.numberOfStateInconsistencies, err = s.stateIntf.CountReorgs(ctx, nil)
+	if err != nil {
+		log.Error("failed to get initial number of reorgs, error: %v", err)
+	}
 	for {
-		waitTick(ctx, ticker)
-		log.Infof("trying to get txs to delete from the pool...")
-		txHashes, err := s.state.GetTxsOlderThanNL1Blocks(ctx, s.cfg.BlocksAmountForTxsToBeDeleted, nil)
+		stateInconsistenciesDetected, err := s.stateIntf.CountReorgs(ctx, nil)
 		if err != nil {
-			log.Errorf("failed to get txs hashes to delete, err: %v", err)
-			continue
+			log.Error("failed to get number of reorgs, error: %v", err)
+			return
 		}
-		log.Infof("will try to delete %d redundant txs", len(txHashes))
-		err = s.pool.DeleteTxsByHashes(ctx, txHashes)
-		if err != nil {
-			log.Errorf("failed to delete txs from the pool, err: %v", err)
-			continue
+
+		if stateInconsistenciesDetected != s.numberOfStateInconsistencies {
+			s.finalizer.Halt(ctx, fmt.Errorf("state inconsistency detected, halting finalizer"), false)
 		}
-		log.Infof("deleted %d selected txs from the pool", len(txHashes))
+
+		time.Sleep(s.cfg.StateConsistencyCheckInterval.Duration)
 	}
 }
 
-func waitTick(ctx context.Context, ticker *time.Ticker) {
-	select {
-	case <-ticker.C:
-		// nothing
-	case <-ctx.Done():
-		return
+func (s *Sequencer) updateDataStreamerFile(ctx context.Context, chainID uint64) {
+	err := state.GenerateDataStreamerFile(ctx, s.streamServer, s.stateIntf, true, nil, chainID, s.cfg.StreamServer.UpgradeEtrogBatchNumber)
+	if err != nil {
+		log.Fatalf("failed to generate data streamer file, error: %v", err)
+	}
+	log.Info("data streamer file updated")
+}
+
+func (s *Sequencer) deleteOldPoolTxs(ctx context.Context) {
+	for {
+		time.Sleep(s.cfg.DeletePoolTxsCheckInterval.Duration)
+		log.Infof("trying to get txs to delete from the pool...")
+		earliestTxHash, err := s.pool.GetEarliestProcessedTx(ctx)
+		if err != nil {
+			log.Errorf("failed to get earliest tx hash to delete, err: %v", err)
+			continue
+		}
+
+		txHashes, err := s.stateIntf.GetTxsOlderThanNL1BlocksUntilTxHash(ctx, s.cfg.DeletePoolTxsL1BlockConfirmations, earliestTxHash, nil)
+		if err != nil {
+			log.Errorf("failed to get txs hashes to delete, error: %v", err)
+			continue
+		}
+		log.Infof("trying to delete %d selected txs", len(txHashes))
+		err = s.pool.DeleteTransactionsByHashes(ctx, txHashes)
+		if err != nil {
+			log.Errorf("failed to delete selected txs from the pool, error: %v", err)
+			continue
+		}
+		log.Infof("deleted %d selected txs from the pool", len(txHashes))
+
+		log.Infof("trying to delete failed txs from the pool")
+		// Delete failed txs older than a certain date (14 seconds per L1 block)
+		err = s.pool.DeleteFailedTransactionsOlderThan(ctx, time.Now().Add(-time.Duration(s.cfg.DeletePoolTxsL1BlockConfirmations*14)*time.Second)) //nolint:gomnd
+		if err != nil {
+			log.Errorf("failed to delete failed txs from the pool, error: %v", err)
+			continue
+		}
+		log.Infof("failed txs deleted from the pool")
+	}
+}
+
+func (s *Sequencer) expireOldWorkerTxs(ctx context.Context) {
+	for {
+		time.Sleep(s.cfg.TxLifetimeCheckInterval.Duration)
+		txTrackers := s.worker.ExpireTransactions(s.cfg.TxLifetimeMax.Duration)
+		failedReason := ErrExpiredTransaction.Error()
+		for _, txTracker := range txTrackers {
+			err := s.pool.UpdateTxStatus(ctx, txTracker.Hash, pool.TxStatusFailed, false, &failedReason)
+			if err != nil {
+				log.Errorf("failed to update tx status, error: %v", err)
+			}
+		}
+	}
+}
+
+// loadFromPool keeps loading transactions from the pool
+func (s *Sequencer) loadFromPool(ctx context.Context) {
+	for {
+		poolTransactions, err := s.pool.GetNonWIPPendingTxs(ctx)
+		if err != nil && err != pool.ErrNotFound {
+			log.Errorf("error loading txs from pool, error: %v", err)
+		}
+
+		for _, tx := range poolTransactions {
+			err := s.addTxToWorker(ctx, tx)
+			if err != nil {
+				log.Errorf("error adding transaction to worker, error: %v", err)
+			}
+		}
+
+		if len(poolTransactions) == 0 {
+			time.Sleep(s.cfg.LoadPoolTxsCheckInterval.Duration)
+		}
+	}
+}
+
+func (s *Sequencer) addTxToWorker(ctx context.Context, tx pool.Transaction) error {
+	txTracker, err := s.worker.NewTxTracker(tx.Transaction, tx.ZKCounters, tx.ReservedZKCounters, tx.IP)
+	if err != nil {
+		return err
+	}
+	replacedTx, dropReason := s.worker.AddTxTracker(ctx, txTracker)
+	if dropReason != nil {
+		failedReason := dropReason.Error()
+		return s.pool.UpdateTxStatus(ctx, txTracker.Hash, pool.TxStatusFailed, false, &failedReason)
+	} else {
+		if replacedTx != nil {
+			failedReason := ErrReplacedTransaction.Error()
+			err := s.pool.UpdateTxStatus(ctx, replacedTx.Hash, pool.TxStatusFailed, false, &failedReason)
+			if err != nil {
+				log.Warnf("error when setting as failed replacedTx %s, error: %v", replacedTx.HashStr, err)
+			}
+		}
+		return s.pool.UpdateTxWIPStatus(ctx, tx.Hash(), true)
+	}
+}
+
+// sendDataToStreamer sends data to the data stream server
+func (s *Sequencer) sendDataToStreamer(chainID uint64) {
+	var err error
+	for {
+		// Read error from previous iteration
+		if err != nil {
+			err = s.streamServer.RollbackAtomicOp()
+			if err != nil {
+				log.Errorf("failed to rollback atomic op, error: %v", err)
+			}
+			s.streamServer = nil
+		}
+
+		// Read data from channel
+		dataStream := <-s.dataToStream
+
+		if s.streamServer != nil {
+			switch data := dataStream.(type) {
+			// Stream a complete L2 block with its transactions
+			case state.DSL2FullBlock:
+				l2Block := data
+
+				err = s.streamServer.StartAtomicOp()
+				if err != nil {
+					log.Errorf("failed to start atomic op for l2block %d, error: %v ", l2Block.L2BlockNumber, err)
+					continue
+				}
+
+				bookMark := state.DSBookMark{
+					Type:  state.BookMarkTypeL2Block,
+					Value: l2Block.L2BlockNumber,
+				}
+
+				_, err = s.streamServer.AddStreamBookmark(bookMark.Encode())
+				if err != nil {
+					log.Errorf("failed to add stream bookmark for l2block %d, error: %v", l2Block.L2BlockNumber, err)
+					continue
+				}
+
+				// Get previous block timestamp to calculate delta timestamp
+				previousL2Block := state.DSL2BlockStart{}
+				if l2Block.L2BlockNumber > 0 {
+					bookMark = state.DSBookMark{
+						Type:  state.BookMarkTypeL2Block,
+						Value: l2Block.L2BlockNumber - 1,
+					}
+
+					previousL2BlockEntry, err := s.streamServer.GetFirstEventAfterBookmark(bookMark.Encode())
+					if err != nil {
+						log.Errorf("failed to get previous l2block %d, error: %v", l2Block.L2BlockNumber-1, err)
+						continue
+					}
+
+					previousL2Block = state.DSL2BlockStart{}.Decode(previousL2BlockEntry.Data)
+				}
+
+				blockStart := state.DSL2BlockStart{
+					BatchNumber:     l2Block.BatchNumber,
+					L2BlockNumber:   l2Block.L2BlockNumber,
+					Timestamp:       l2Block.Timestamp,
+					DeltaTimestamp:  uint32(l2Block.Timestamp - previousL2Block.Timestamp),
+					L1InfoTreeIndex: l2Block.L1InfoTreeIndex,
+					L1BlockHash:     l2Block.L1BlockHash,
+					GlobalExitRoot:  l2Block.GlobalExitRoot,
+					Coinbase:        l2Block.Coinbase,
+					ForkID:          l2Block.ForkID,
+					ChainID:         uint32(chainID),
+				}
+
+				_, err = s.streamServer.AddStreamEntry(state.EntryTypeL2BlockStart, blockStart.Encode())
+				if err != nil {
+					log.Errorf("failed to add stream entry for l2block %d, error: %v", l2Block.L2BlockNumber, err)
+					continue
+				}
+
+				for _, l2Transaction := range l2Block.Txs {
+					_, err = s.streamServer.AddStreamEntry(state.EntryTypeL2Tx, l2Transaction.Encode())
+					if err != nil {
+						log.Errorf("failed to add l2tx stream entry for l2block %d, error: %v", l2Block.L2BlockNumber, err)
+						continue
+					}
+				}
+
+				blockEnd := state.DSL2BlockEnd{
+					L2BlockNumber: l2Block.L2BlockNumber,
+					BlockHash:     l2Block.BlockHash,
+					StateRoot:     l2Block.StateRoot,
+				}
+
+				_, err = s.streamServer.AddStreamEntry(state.EntryTypeL2BlockEnd, blockEnd.Encode())
+				if err != nil {
+					log.Errorf("failed to add stream entry for l2block %d, error: %v", l2Block.L2BlockNumber, err)
+					continue
+				}
+
+				err = s.streamServer.CommitAtomicOp()
+				if err != nil {
+					log.Errorf("failed to commit atomic op for l2block %d, error: %v ", l2Block.L2BlockNumber, err)
+					continue
+				}
+
+			// Stream a bookmark
+			case state.DSBookMark:
+				bookmark := data
+
+				err = s.streamServer.StartAtomicOp()
+				if err != nil {
+					log.Errorf("failed to start atomic op for bookmark type %d, value %d, error: %v", bookmark.Type, bookmark.Value, err)
+					continue
+				}
+
+				_, err = s.streamServer.AddStreamBookmark(bookmark.Encode())
+				if err != nil {
+					log.Errorf("failed to add stream bookmark type %d, value %d, error: %v", bookmark.Type, bookmark.Value, err)
+					continue
+				}
+
+				err = s.streamServer.CommitAtomicOp()
+				if err != nil {
+					log.Errorf("failed to commit atomic op for bookmark type %d, value %d, error: %v", bookmark.Type, bookmark.Value, err)
+				}
+
+			// Invalid stream message type
+			default:
+				log.Errorf("invalid stream message type received")
+			}
+		}
 	}
 }
 
 func (s *Sequencer) isSynced(ctx context.Context) bool {
-	lastSyncedBatchNum, err := s.state.GetLastVirtualBatchNum(ctx, nil)
+	lastVirtualBatchNum, err := s.stateIntf.GetLastVirtualBatchNum(ctx, nil)
 	if err != nil && err != state.ErrNotFound {
-		log.Errorf("failed to get last synced batch, err: %v", err)
+		log.Errorf("failed to get last isSynced batch, error: %v", err)
 		return false
+	}
+	lastTrustedBatchNum, err := s.stateIntf.GetLastBatchNumber(ctx, nil)
+	if err != nil && err != state.ErrNotFound {
+		log.Errorf("failed to get last batch num, error: %v", err)
+		return false
+	}
+	if lastTrustedBatchNum > lastVirtualBatchNum {
+		return true
 	}
 	lastEthBatchNum, err := s.etherman.GetLatestBatchNumber()
 	if err != nil {
-		log.Errorf("failed to get last eth batch, err: %v", err)
+		log.Errorf("failed to get last eth batch, error: %v", err)
 		return false
 	}
-	if lastSyncedBatchNum < lastEthBatchNum {
-		log.Infof("waiting for the state to be synced, lastSyncedBatchNum: %d, lastEthBatchNum: %d", lastSyncedBatchNum, lastEthBatchNum)
+	if lastVirtualBatchNum < lastEthBatchNum {
+		log.Infof("waiting for the state to be synced, lastVirtualBatchNum: %d, lastEthBatchNum: %d", lastVirtualBatchNum, lastEthBatchNum)
 		return false
 	}
 
 	return true
-}
-
-func (s *Sequencer) loadSequenceFromState(ctx context.Context) error {
-	// Check if synchronizer is up to date
-	for !s.isSynced(ctx) {
-		log.Info("wait for synchronizer to sync last batch")
-		time.Sleep(time.Second)
-	}
-	// Revert reorged txs to pending
-	if err := s.pool.MarkReorgedTxsAsPending(ctx); err != nil {
-		return fmt.Errorf("failed to mark reorged txs as pending, err: %w", err)
-	}
-	// Get latest info from the state
-	lastBatch, err := s.state.GetLastBatch(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to get last batch, err: %w", err)
-	}
-	isClosed, err := s.state.IsBatchClosed(ctx, lastBatch.BatchNumber, nil)
-	if err != nil {
-		return fmt.Errorf("failed to check is batch closed or not, err: %w", err)
-	}
-	if isClosed {
-		dbTx, err := s.state.BeginStateTransaction(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to begin state tx to open a batch, err: %w", err)
-		}
-		ger, _, err := s.getLatestGer(ctx, dbTx)
-		if err != nil {
-			if rollbackErr := dbTx.Rollback(ctx); rollbackErr != nil {
-				return fmt.Errorf(
-					"failed to rollback dbTx when getting last GER that gave err: %s. Rollback err: %s",
-					rollbackErr.Error(), err.Error(),
-				)
-			}
-			return fmt.Errorf("failed to get latest global exit root, err: %w", err)
-		}
-		processingCtx := state.ProcessingContext{
-			BatchNumber:    lastBatch.BatchNumber + 1,
-			Coinbase:       s.address,
-			Timestamp:      time.Now(),
-			GlobalExitRoot: ger.GlobalExitRoot,
-		}
-		err = s.state.OpenBatch(ctx, processingCtx, dbTx)
-		if err != nil {
-			rollErr := dbTx.Rollback(ctx)
-			if rollErr != nil {
-				err = fmt.Errorf("failed to open a batch, err: %w. Rollback err: %v", err, rollErr)
-			}
-			return err
-		}
-		if err = dbTx.Commit(ctx); err != nil {
-			return fmt.Errorf("failed to commit a state tx to open a batch, err: %w", err)
-		}
-		s.sequenceInProgress = types.Sequence{
-			GlobalExitRoot: processingCtx.GlobalExitRoot,
-			Timestamp:      processingCtx.Timestamp.Unix(),
-		}
-	} else {
-		txs, err := s.state.GetTransactionsByBatchNumber(ctx, lastBatch.BatchNumber, nil)
-		if err != nil {
-			return fmt.Errorf("failed to get tx by batch number, err: %w", err)
-		}
-		s.sequenceInProgress = types.Sequence{
-			GlobalExitRoot: lastBatch.GlobalExitRoot,
-			Timestamp:      lastBatch.Timestamp.Unix(),
-			Txs:            txs,
-		}
-		// TODO: execute to get state root and LER or change open/closed logic so we always store state root and LER and add an open flag
-	}
-
-	return nil
-	/*
-		TODO: deal with ongoing L1 txs
-	*/
-}
-
-func (s *Sequencer) createFirstBatch(ctx context.Context) {
-	log.Infof("starting sequencer with genesis batch")
-	processingCtx := state.ProcessingContext{
-		BatchNumber:    1,
-		Coinbase:       s.address,
-		Timestamp:      time.Now(),
-		GlobalExitRoot: state.ZeroHash,
-	}
-	dbTx, err := s.state.BeginStateTransaction(ctx)
-	if err != nil {
-		log.Fatalf("failed to begin state transaction for opening a batch, err: %v", err)
-	}
-	err = s.state.OpenBatch(ctx, processingCtx, dbTx)
-	if err != nil {
-		if rollbackErr := dbTx.Rollback(ctx); rollbackErr != nil {
-			log.Fatalf(
-				"failed to rollback dbTx when opening batch that gave err: %v. Rollback err: %v",
-				rollbackErr, err,
-			)
-		}
-		log.Fatalf("failed to open a batch, err: %v", err)
-	}
-	if err := dbTx.Commit(ctx); err != nil {
-		log.Fatalf("failed to commit dbTx when opening batch, err: %v", err)
-	}
-	s.sequenceInProgress = types.Sequence{
-		GlobalExitRoot: processingCtx.GlobalExitRoot,
-		Timestamp:      processingCtx.Timestamp.Unix(),
-		Txs:            []ethTypes.Transaction{},
-	}
 }

@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"mime"
 	"net"
 	"net/http"
+	"syscall"
 	"time"
 
 	"github.com/0xPolygonHermez/zkevm-node/jsonrpc/metrics"
+	"github.com/0xPolygonHermez/zkevm-node/jsonrpc/types"
 	"github.com/0xPolygonHermez/zkevm-node/log"
 	"github.com/didip/tollbooth/v6"
 	"github.com/gorilla/websocket"
@@ -32,61 +35,59 @@ const (
 	APIWeb3 = "web3"
 
 	wsBufferSizeLimitInBytes = 1024
+	maxRequestContentLength  = 1024 * 1024 * 5
+	contentType              = "application/json"
 )
+
+// https://www.jsonrpc.org/historical/json-rpc-over-http.html#http-header
+var acceptedContentTypes = []string{contentType, "application/json-rpc", "application/jsonrequest"}
 
 // Server is an API backend to handle RPC requests
 type Server struct {
 	config     Config
+	chainID    uint64
 	handler    *Handler
 	srv        *http.Server
 	wsSrv      *http.Server
 	wsUpgrader websocket.Upgrader
 }
 
+// Service defines a struct that will provide public methods to be exposed
+// by the RPC server as endpoints, the endpoints will be prefixed with the
+// value in the Name property followed by an underscore and the method name
+// starting with a lower case char, resulting in a mix of snake case and
+// camel case, for example:
+//
+// A service with name `eth` and with a public method BlockNumber() will allow
+// the RPC server to expose this method as `eth_blockNumber`.
+type Service struct {
+	Name    string
+	Service interface{}
+}
+
 // NewServer returns the JsonRPC server
 func NewServer(
 	cfg Config,
-	p jsonRPCTxPool,
-	s stateInterface,
-	gpe gasPriceEstimator,
+	chainID uint64,
+	p types.PoolInterface,
+	s types.StateInterface,
 	storage storageInterface,
-	apis map[string]bool,
+	services []Service,
 ) *Server {
+	if cfg.WebSockets.Enabled {
+		s.StartToMonitorNewL2Blocks()
+	}
+
 	handler := newJSONRpcHandler()
 
-	if _, ok := apis[APIEth]; ok {
-		ethEndpoints := newEth(cfg, p, s, gpe, storage)
-		handler.registerService(APIEth, ethEndpoints)
-	}
-
-	if _, ok := apis[APINet]; ok {
-		netEndpoints := &Net{cfg: cfg}
-		handler.registerService(APINet, netEndpoints)
-	}
-
-	if _, ok := apis[APIZKEVM]; ok {
-		hezEndpoints := &ZKEVM{state: s, config: cfg}
-		handler.registerService(APIZKEVM, hezEndpoints)
-	}
-
-	if _, ok := apis[APITxPool]; ok {
-		txPoolEndpoints := &TxPool{}
-		handler.registerService(APITxPool, txPoolEndpoints)
-	}
-
-	if _, ok := apis[APIDebug]; ok {
-		debugEndpoints := &Debug{state: s}
-		handler.registerService(APIDebug, debugEndpoints)
-	}
-
-	if _, ok := apis[APIWeb3]; ok {
-		web3Endpoints := &Web3{}
-		handler.registerService(APIWeb3, web3Endpoints)
+	for _, service := range services {
+		handler.registerService(service)
 	}
 
 	srv := &Server{
 		config:  cfg,
 		handler: handler,
+		chainID: chainID,
 	}
 	return srv
 }
@@ -122,9 +123,10 @@ func (s *Server) startHTTP() error {
 	mux.Handle("/", tollbooth.LimitFuncHandler(lmt, s.handle))
 
 	s.srv = &http.Server{
-		Handler:      mux,
-		ReadTimeout:  s.config.ReadTimeoutInSec * time.Second,
-		WriteTimeout: s.config.WriteTimeoutInSec * time.Second,
+		Handler:           mux,
+		ReadHeaderTimeout: s.config.ReadTimeout.Duration,
+		ReadTimeout:       s.config.ReadTimeout.Duration,
+		WriteTimeout:      s.config.WriteTimeout.Duration,
 	}
 	log.Infof("http server started: %s", address)
 	if err := s.srv.Serve(lis); err != nil {
@@ -147,7 +149,7 @@ func (s *Server) startWS() {
 		return
 	}
 
-	address := fmt.Sprintf("%s:%d", s.config.Host, s.config.WebSockets.Port)
+	address := fmt.Sprintf("%s:%d", s.config.WebSockets.Host, s.config.WebSockets.Port)
 
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
@@ -159,9 +161,10 @@ func (s *Server) startWS() {
 	mux.HandleFunc("/", s.handleWs)
 
 	s.wsSrv = &http.Server{
-		Handler:      mux,
-		ReadTimeout:  s.config.ReadTimeoutInSec * time.Second,
-		WriteTimeout: s.config.WriteTimeoutInSec * time.Second,
+		Handler:           mux,
+		ReadHeaderTimeout: s.config.ReadTimeout.Duration,
+		ReadTimeout:       s.config.ReadTimeout.Duration,
+		WriteTimeout:      s.config.WriteTimeout.Duration,
 	}
 	s.wsUpgrader = websocket.Upgrader{
 		ReadBufferSize:  wsBufferSizeLimitInBytes,
@@ -206,18 +209,16 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) handle(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
 
-	if (*req).Method == "OPTIONS" {
-		// TODO(pg): need to count it in the metrics?
+	if req.Method == http.MethodOptions {
 		return
 	}
 
-	if req.Method == "GET" {
-		// TODO(pg): need to count it in the metrics?
+	if req.Method == http.MethodGet {
 		_, err := w.Write([]byte("zkEVM JSON RPC Server"))
 		if err != nil {
 			log.Error(err)
@@ -225,78 +226,123 @@ func (s *Server) handle(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if req.Method != "POST" {
-		err := errors.New("method " + req.Method + " not allowed")
-		s.handleInvalidRequest(w, err)
+	if code, err := validateRequest(req); err != nil {
+		handleInvalidRequest(w, err, code)
 		return
 	}
 
-	data, err := ioutil.ReadAll(req.Body)
+	body := io.LimitReader(req.Body, maxRequestContentLength)
+	data, err := io.ReadAll(body)
 	if err != nil {
-		s.handleInvalidRequest(w, err)
+		handleError(w, err)
 		return
 	}
 
 	single, err := s.isSingleRequest(data)
 	if err != nil {
-		s.handleInvalidRequest(w, err)
+		handleInvalidRequest(w, err, http.StatusBadRequest)
 		return
 	}
 
+	s.increaseHttpConnCounter()
+
 	start := time.Now()
+	var respLen int
 	if single {
-		s.handleSingleRequest(w, data)
+		respLen = s.handleSingleRequest(req, w, data)
 	} else {
-		s.handleBatchRequest(w, data)
+		respLen = s.handleBatchRequest(req, w, data)
 	}
 	metrics.RequestDuration(start)
+	s.combinedLog(req, start, http.StatusOK, respLen)
 }
 
-func (s *Server) isSingleRequest(data []byte) (bool, rpcError) {
+// validateRequest returns a non-zero response code and error message if the
+// request is invalid.
+func validateRequest(req *http.Request) (int, error) {
+	if req.Method != http.MethodPost {
+		err := errors.New("method " + req.Method + " not allowed")
+		return http.StatusMethodNotAllowed, err
+	}
+
+	if req.ContentLength > maxRequestContentLength {
+		err := fmt.Errorf("content length too large (%d>%d)", req.ContentLength, maxRequestContentLength)
+		return http.StatusRequestEntityTooLarge, err
+	}
+
+	// Check content-type
+	if mt, _, err := mime.ParseMediaType(req.Header.Get("content-type")); err == nil {
+		for _, accepted := range acceptedContentTypes {
+			if accepted == mt {
+				return 0, nil
+			}
+		}
+	}
+	// Invalid content-type
+	err := fmt.Errorf("invalid content type, only %s is supported", contentType)
+	return http.StatusUnsupportedMediaType, err
+}
+
+func (s *Server) isSingleRequest(data []byte) (bool, error) {
 	x := bytes.TrimLeft(data, " \t\r\n")
 
 	if len(x) == 0 {
-		return false, newRPCError(invalidRequestErrorCode, "Invalid json request")
+		return false, fmt.Errorf("empty request body")
 	}
 
-	return x[0] == '{', nil
+	return x[0] != '[', nil
 }
 
-func (s *Server) handleSingleRequest(w http.ResponseWriter, data []byte) {
+func (s *Server) handleSingleRequest(httpRequest *http.Request, w http.ResponseWriter, data []byte) int {
 	defer metrics.RequestHandled(metrics.RequestHandledLabelSingle)
 	request, err := s.parseRequest(data)
 	if err != nil {
-		handleError(w, err)
-		return
+		handleInvalidRequest(w, err, http.StatusBadRequest)
+		return 0
 	}
-	req := handleRequest{Request: request}
+	req := handleRequest{Request: request, HttpRequest: httpRequest}
 	response := s.handler.Handle(req)
 
 	respBytes, err := json.Marshal(response)
 	if err != nil {
 		handleError(w, err)
-		return
+		return 0
 	}
 
 	_, err = w.Write(respBytes)
 	if err != nil {
 		handleError(w, err)
-		return
+		return 0
 	}
+	return len(respBytes)
 }
 
-func (s *Server) handleBatchRequest(w http.ResponseWriter, data []byte) {
+func (s *Server) handleBatchRequest(httpRequest *http.Request, w http.ResponseWriter, data []byte) int {
+	// Checking if batch requests are enabled
+	if !s.config.BatchRequestsEnabled {
+		handleInvalidRequest(w, types.ErrBatchRequestsDisabled, http.StatusBadRequest)
+		return 0
+	}
+
 	defer metrics.RequestHandled(metrics.RequestHandledLabelBatch)
 	requests, err := s.parseRequests(data)
 	if err != nil {
-		handleError(w, err)
-		return
+		handleInvalidRequest(w, err, http.StatusBadRequest)
+		return 0
 	}
 
-	responses := make([]Response, 0, len(requests))
+	// Checking if batch requests limit is exceeded
+	if s.config.BatchRequestsLimit > 0 {
+		if len(requests) > int(s.config.BatchRequestsLimit) {
+			handleInvalidRequest(w, types.ErrBatchRequestsLimitExceeded, http.StatusRequestEntityTooLarge)
+			return 0
+		}
+	}
+
+	responses := make([]types.Response, 0, len(requests))
 
 	for _, request := range requests {
-		req := handleRequest{Request: request}
+		req := handleRequest{Request: request, HttpRequest: httpRequest}
 		response := s.handler.Handle(req)
 		responses = append(responses, response)
 	}
@@ -305,32 +351,29 @@ func (s *Server) handleBatchRequest(w http.ResponseWriter, data []byte) {
 	_, err = w.Write(respBytes)
 	if err != nil {
 		log.Error(err)
+		return 0
 	}
+	return len(respBytes)
 }
 
-func (s *Server) parseRequest(data []byte) (Request, error) {
-	var req Request
+func (s *Server) parseRequest(data []byte) (types.Request, error) {
+	var req types.Request
 
 	if err := json.Unmarshal(data, &req); err != nil {
-		return Request{}, newRPCError(invalidRequestErrorCode, "Invalid json request")
+		return types.Request{}, fmt.Errorf("invalid json object request body")
 	}
 
 	return req, nil
 }
 
-func (s *Server) parseRequests(data []byte) ([]Request, error) {
-	var requests []Request
+func (s *Server) parseRequests(data []byte) ([]types.Request, error) {
+	var requests []types.Request
 
 	if err := json.Unmarshal(data, &requests); err != nil {
-		return nil, newRPCError(invalidRequestErrorCode, "Invalid json request")
+		return nil, fmt.Errorf("invalid json array request body")
 	}
 
 	return requests, nil
-}
-
-func (s *Server) handleInvalidRequest(w http.ResponseWriter, err error) {
-	defer metrics.RequestHandled(metrics.RequestHandledLabelInvalid)
-	handleError(w, err)
 }
 
 func (s *Server) handleWs(w http.ResponseWriter, req *http.Request) {
@@ -338,27 +381,41 @@ func (s *Server) handleWs(w http.ResponseWriter, req *http.Request) {
 	s.wsUpgrader.CheckOrigin = func(r *http.Request) bool { return true }
 
 	// Upgrade the connection to a WS one
-	wsConn, err := s.wsUpgrader.Upgrade(w, req, nil)
+	innerWsConn, err := s.wsUpgrader.Upgrade(w, req, nil)
 	if err != nil {
 		log.Error(fmt.Sprintf("Unable to upgrade to a WS connection, %s", err.Error()))
-
 		return
 	}
 
+	wsConn := newConcurrentWsConn(innerWsConn)
+
+	// Set read limit
+	wsConn.SetReadLimit(s.config.WebSockets.ReadLimit)
+
 	// Defer WS closure
-	defer func(ws *websocket.Conn) {
-		err = ws.Close()
+	defer func(wsConn *concurrentWsConn) {
+		err = wsConn.Close()
 		if err != nil {
 			log.Error(fmt.Sprintf("Unable to gracefully close WS connection, %s", err.Error()))
 		}
 	}(wsConn)
 
+	s.increaseWsConnCounter()
+
+	// recover
+	defer func() {
+		if err := recover(); err != nil {
+			log.Error(err)
+		}
+	}()
 	log.Info("Websocket connection established")
 	for {
 		msgType, message, err := wsConn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure) {
 				log.Info("Closing WS connection gracefully")
+			} else if errors.Is(err, websocket.ErrReadLimit) {
+				log.Info("Closing WS connection due to read limit exceeded")
 			} else {
 				log.Error(fmt.Sprintf("Unable to read WS message, %s", err.Error()))
 				log.Info("Closing WS connection with error")
@@ -370,32 +427,75 @@ func (s *Server) handleWs(w http.ResponseWriter, req *http.Request) {
 		}
 
 		if msgType == websocket.TextMessage || msgType == websocket.BinaryMessage {
-			go func() {
-				resp, err := s.handler.HandleWs(message, wsConn)
-				if err != nil {
-					log.Error(fmt.Sprintf("Unable to handle WS request, %s", err.Error()))
-					_ = wsConn.WriteMessage(msgType, []byte(fmt.Sprintf("WS Handle error: %s", err.Error())))
-				} else {
-					_ = wsConn.WriteMessage(msgType, resp)
-				}
-			}()
+			resp, err := s.handler.HandleWs(message, wsConn, req)
+			if err != nil {
+				log.Error(fmt.Sprintf("Unable to handle WS request, %s", err.Error()))
+				_ = wsConn.WriteMessage(msgType, []byte(fmt.Sprintf("WS Handle error: %s", err.Error())))
+			} else {
+				_ = wsConn.WriteMessage(msgType, resp)
+			}
 		}
 	}
 }
 
-func handleError(w http.ResponseWriter, err error) {
-	log.Error(err)
-	_, err = w.Write([]byte(err.Error()))
-	if err != nil {
-		log.Error(err)
-	}
+func (s *Server) increaseHttpConnCounter() {
+	metrics.CountConn(metrics.HTTPConnLabel)
 }
 
-func rpcErrorResponse(code int, errorMessage string, err error) (interface{}, rpcError) {
-	if err != nil {
-		log.Errorf("%v:%v", errorMessage, err.Error())
-	} else {
-		log.Error(errorMessage)
+func (s *Server) increaseWsConnCounter() {
+	metrics.CountConn(metrics.WSConnLabel)
+}
+
+func handleInvalidRequest(w http.ResponseWriter, err error, code int) {
+	defer metrics.RequestHandled(metrics.RequestHandledLabelInvalid)
+	log.Debugf("Invalid Request: %v", err.Error())
+	http.Error(w, err.Error(), code)
+}
+
+func handleError(w http.ResponseWriter, err error) {
+	defer metrics.RequestHandled(metrics.RequestHandledLabelError)
+
+	if errors.Is(err, syscall.EPIPE) {
+		// if it is a broken pipe error, return
+		return
 	}
-	return nil, newRPCError(code, errorMessage)
+
+	// if it is a different error, write it to the response
+	log.Errorf("Error processing request: %v", err)
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// RPCErrorResponse formats error to be returned through RPC
+func RPCErrorResponse(code int, message string, err error, logError bool) (interface{}, types.Error) {
+	return RPCErrorResponseWithData(code, message, nil, err, logError)
+}
+
+// RPCErrorResponseWithData formats error to be returned through RPC
+func RPCErrorResponseWithData(code int, message string, data []byte, err error, logError bool) (interface{}, types.Error) {
+	if logError {
+		if err != nil {
+			log.Debugf("%v: %v", message, err.Error())
+		} else {
+			log.Debug(message)
+		}
+	}
+	return nil, types.NewRPCErrorWithData(code, message, data)
+}
+
+func (s *Server) combinedLog(r *http.Request, start time.Time, httpStatus, dataLen int) {
+	if !s.config.EnableHttpLog {
+		return
+	}
+
+	log.Infof("%s - - %s \"%s %s %s\" %d %d \"%s\" \"%s\"",
+		r.RemoteAddr,
+		start.Format("[02/Jan/2006:15:04:05 -0700]"),
+		r.Method,
+		r.URL.Path,
+		r.Proto,
+		httpStatus,
+		dataLen,
+		r.Host,
+		r.UserAgent(),
+	)
 }
